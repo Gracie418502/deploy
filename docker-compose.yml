@@ -164,7 +164,7 @@ services:
       - app_network
 
   alertmanager:
-    image: prom/alertmanager:v0.34.2
+    image: prom/alertmanager:v0.35.0
     container_name: app_alertmanager
     restart: unless-stopped
     profiles:
@@ -188,7 +188,7 @@ services:
       - app_network
 
   grafana:
-    image: grafana/grafana:13.3.0
+    image: grafana/grafana:13.3.1
     container_name: app_grafana
     restart: unless-stopped
     profiles:
