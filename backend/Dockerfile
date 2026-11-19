@@ -17,25 +17,23 @@ ARG NPM_FLAGS
 WORKDIR /app
 
 # Build tooling for any native modules
-RUN apk add --no-cache python3 make g++
+RUN apk add --no-cache python3=3.14.10-r1 make=4.4.1-r4 g++=15.2.0-r5
 
 COPY package.json package-lock.json* ./
 # Skip lifecycle scripts: the postinstall symlinks packages/registry-client,
 # which is not copied yet. It is vendored explicitly below instead.
-# `npm ci` needs a committed lockfile; fall back to `npm install` without one.
-RUN if [ -f package-lock.json ]; then npm ci --ignore-scripts ${NPM_FLAGS} || npm ci --ignore-scripts --legacy-peer-deps; \
-    else npm install --ignore-scripts --no-audit --no-fund ${NPM_FLAGS} || npm install --ignore-scripts --no-audit --no-fund --legacy-peer-deps; fi
+# Require the committed lockfile to keep the image reproducible.
+RUN npm ci --ignore-scripts ${NPM_FLAGS}
 
 # ---------- Stage 2: Production-only dependencies ----------
 FROM node:${NODE_VERSION}-alpine AS prod-deps
 ARG NPM_FLAGS
 WORKDIR /app
 
-RUN apk add --no-cache python3 make g++
+RUN apk add --no-cache python3=3.14.10-r1 make=4.4.1-r4 g++=15.2.0-r5
 
 COPY package.json package-lock.json* ./
-RUN if [ -f package-lock.json ]; then npm ci --omit=dev --ignore-scripts ${NPM_FLAGS} || npm ci --omit=dev --ignore-scripts --legacy-peer-deps; \
-    else npm install --omit=dev --ignore-scripts --no-audit --no-fund ${NPM_FLAGS} || npm install --omit=dev --ignore-scripts --no-audit --no-fund --legacy-peer-deps; fi
+RUN npm ci --omit=dev --ignore-scripts ${NPM_FLAGS}
 
 COPY packages/registry-client ./packages/registry-client
 RUN mkdir -p node_modules/@synapsvault && \
@@ -67,7 +65,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 
 # Install drizzle-kit standalone (no app dependency tree required).
-RUN npm install --no-audit --no-fund --ignore-scripts ${NPM_FLAGS} drizzle-kit
+RUN npm install --no-audit --no-fund --ignore-scripts ${NPM_FLAGS} drizzle-kit@0.31.11
 
 # Only the config and migrations are required at runtime.
 COPY drizzle.config.ts ./drizzle.config.ts
@@ -83,7 +81,7 @@ WORKDIR /app
 # tini runs as PID 1 so it reaps zombies and forwards SIGTERM/SIGINT to Node,
 # letting the server shut down gracefully during rollouts instead of being
 # killed abruptly.
-RUN apk add --no-cache tini
+RUN apk add --no-cache tini=0.19.0-r3
 
 ENV NODE_ENV=production \
     PORT=3000

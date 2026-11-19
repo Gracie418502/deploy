@@ -63,7 +63,7 @@ jobs:
           archive="$(mktemp)"
           curl -sSfL "https://github.com/lycheeverse/lychee/releases/download/lychee-v${LYCHEE_VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz" -o "$archive"
           echo "1f4e0ef7f6554a6ed33dd7ac144fb2e1bbed98598e7af973042fc5cd43951c9a  $archive" | sha256sum -c -
-          tar -xz -f "$archive" -C /usr/local/bin lychee
+          tar -xz -f "$archive" --strip-components=1 -C /usr/local/bin lychee-x86_64-unknown-linux-gnu/lychee
           rm -f "$archive"
       - name: Run lychee
         run: lychee --config .lychee.toml --no-progress --verbose README.md 'docs/**/*.md'
