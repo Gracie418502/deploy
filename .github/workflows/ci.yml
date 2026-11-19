@@ -20,9 +20,9 @@ env:
   KUBE_LINTER_VERSION: '0.7.1'
   PROMETHEUS_VERSION: '2.53.2'
   ALERTMANAGER_VERSION: '0.27.0'
-  LYCHEE_VERSION: '0.15.1'
+  LYCHEE_VERSION: '0.24.2'
   GITLEAKS_VERSION: '8.18.4'
-  TRIVY_VERSION: '0.55.2'
+  TRIVY_VERSION: '0.76.2'
   HADOLINT_VERSION: '2.12.0'
 
 jobs:
@@ -60,8 +60,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install lychee
         run: |
-          curl -sSfL "https://github.com/lycheeverse/lychee/releases/download/lychee-v${LYCHEE_VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz" \
-            | tar -xz -C /usr/local/bin lychee
+          archive="$(mktemp)"
+          curl -sSfL "https://github.com/lycheeverse/lychee/releases/download/lychee-v${LYCHEE_VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz" -o "$archive"
+          echo "1f4e0ef7f6554a6ed33dd7ac144fb2e1bbed98598e7af973042fc5cd43951c9a  $archive" | sha256sum -c -
+          tar -xz -f "$archive" -C /usr/local/bin lychee
+          rm -f "$archive"
       - name: Run lychee
         run: lychee --config .lychee.toml --no-progress --verbose README.md 'docs/**/*.md'
 
@@ -302,8 +305,11 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
       - name: Install Trivy
         run: |
-          curl -sSfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
-            | tar -xz -C /usr/local/bin trivy
+          archive="$(mktemp)"
+          curl -sSfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -o "$archive"
+          echo "bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf  $archive" | sha256sum -c -
+          tar -xz -f "$archive" -C /usr/local/bin trivy
+          rm -f "$archive"
       - name: Scan ${{ matrix.name }} for vulnerabilities
         # Fail the build on any CRITICAL CVE and emit SARIF for code scanning.
         run: |

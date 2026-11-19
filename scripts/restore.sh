@@ -207,7 +207,7 @@ fi
 
 VERIFY_DB=""
 
-# shellcheck disable=SC2317  # invoked via the EXIT trap below
+# shellcheck disable=SC2317,SC2329  # invoked via the EXIT trap below
 cleanup() {
   local status=$?
   if [[ -n "$VERIFY_DB" ]]; then
