@@ -1,0 +1,63 @@
+name: Dependency Security
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '20 3 * * *'
+  workflow_dispatch:
+
+# Do not grant access to repository secrets or install untrusted project packages.
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    name: Review dependency changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check new dependencies against GitHub advisories
+        uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
+        with:
+          fail-on-severity: low
+          fail-on-scopes: runtime, development, unknown
+          license-check: false
+
+  scan-pr:
+    if: github.event_name == 'pull_request'
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@32d3cd482bdadfb38b186c0ad1b031902d55d932 # v2.7.1
+    permissions:
+      contents: read
+      actions: read
+      security-events: write # Required by the pinned reusable workflow, even with SARIF disabled.
+    with:
+      fail-on-vuln: true
+      upload-sarif: false
+
+  malware-gate:
+    name: Dependency malware gate
+    if: always() && github.event_name == 'pull_request'
+    needs: [dependency-review, scan-pr]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require both dependency scans to pass
+        env:
+          REVIEW_RESULT: ${{ needs.dependency-review.result }}
+          SCAN_RESULT: ${{ needs.scan-pr.result }}
+        run: test "$REVIEW_RESULT" = success && test "$SCAN_RESULT" = success
+
+  scan-existing:
+    if: github.event_name != 'pull_request'
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@32d3cd482bdadfb38b186c0ad1b031902d55d932 # v2.7.1
+    permissions:
+      contents: read
+      actions: read
+      security-events: write # Required by the pinned reusable workflow, even with SARIF disabled.
+    with:
+      fail-on-vuln: true
+      upload-sarif: false
