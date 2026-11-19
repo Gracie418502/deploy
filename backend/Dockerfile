@@ -65,7 +65,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 
 # Install drizzle-kit standalone (no app dependency tree required).
-RUN npm install --no-audit --no-fund --ignore-scripts ${NPM_FLAGS} drizzle-kit@0.31.11
+RUN npm install --no-audit --no-fund --ignore-scripts drizzle-kit@0.31.11
 
 # Only the config and migrations are required at runtime.
 COPY drizzle.config.ts ./drizzle.config.ts
