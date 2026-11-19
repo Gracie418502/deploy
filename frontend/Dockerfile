@@ -25,8 +25,7 @@ ENV VITE_API_URL=${VITE_API_URL} \
 
 # Install dependencies (leverage layer caching)
 COPY package.json package-lock.json* ./
-RUN if [ -f package-lock.json ]; then npm ci ${NPM_FLAGS} || npm ci --legacy-peer-deps; \
-    else npm install --no-audit --no-fund ${NPM_FLAGS} || npm install --no-audit --no-fund --legacy-peer-deps; fi
+RUN npm ci ${NPM_FLAGS}
 
 # Copy source and build
 COPY . .
@@ -36,6 +35,8 @@ RUN npm run build
 FROM nginx:1.31-alpine AS runtime
 
 # Serve the SPA on an unprivileged port; runtime config lives in writable /tmp.
+## The variables below are intentionally literal until nginx or the container entrypoint reads them.
+# hadolint ignore=SC2016
 RUN printf '%s\n' \
     'pid /tmp/nginx.pid;' \
     'events {}' \
@@ -53,7 +54,7 @@ RUN printf '%s\n' \
     '    location / { try_files $uri $uri/ /index.html; }' \
     '  }' \
     '}' > /etc/nginx/nginx.conf \
-    && apk add --no-cache jq
+    && apk add --no-cache jq=1.8.2-r0
 
 # Copy built assets from the build stage
 COPY --from=build /app/dist /usr/share/nginx/html
@@ -67,6 +68,8 @@ ENV APP_API_URL=/api \
     APP_NETWORK=testnet \
     APP_SENTRY_DSN=""
 
+## The variables below are intentionally literal until nginx or the container entrypoint reads them.
+# hadolint ignore=SC2016
 RUN printf '%s\n' \
     '#!/bin/sh' \
     'set -eu' \
