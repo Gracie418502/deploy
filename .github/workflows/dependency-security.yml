@@ -33,6 +33,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      security-events: write # Required by the pinned reusable workflow, even with SARIF disabled.
     with:
       fail-on-vuln: true
       upload-sarif: false
@@ -56,6 +57,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      security-events: write # Required by the pinned reusable workflow, even with SARIF disabled.
     with:
       fail-on-vuln: true
       upload-sarif: false
