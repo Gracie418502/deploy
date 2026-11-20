@@ -303,6 +303,58 @@ jobs:
           tags: synapsvault/${{ matrix.name }}:ci
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+      - name: Smoke-test frontend with a read-only root filesystem
+        if: matrix.name == 'frontend'
+        run: |
+          container_id="$(docker run -d \
+            --name frontend-read-only-ci \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --health-interval=2s \
+            --health-timeout=5s \
+            --health-retries=5 \
+            --health-start-period=0s \
+            -p 127.0.0.1:8080:8080 \
+            synapsvault/frontend:ci)"
+          cleanup() {
+            docker rm -f "$container_id" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          test "$(docker inspect --format '{{.Config.User}}' "$container_id")" = "101"
+          test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$container_id")" = "true"
+
+          for attempt in $(seq 1 30); do
+            health="$(docker inspect --format '{{.State.Health.Status}}' "$container_id")"
+            if [ "$health" = "healthy" ]; then
+              break
+            fi
+            if [ "$health" = "unhealthy" ]; then
+              docker logs "$container_id"
+              exit 1
+            fi
+            sleep 1
+          done
+          test "$health" = "healthy"
+
+          curl --fail --silent --show-error http://127.0.0.1:8080/ \
+            --output /tmp/frontend-index.html
+          curl --fail --silent --show-error http://127.0.0.1:8080/config.js \
+            --output /tmp/frontend-config.js
+          grep -q 'window.__APP_CONFIG__' /tmp/frontend-config.js
+
+          asset_path="$(grep -oE '(src|href)="[^"]+\.(js|css)(\?[^"]*)?"' \
+            /tmp/frontend-index.html | head -n 1 | cut -d '"' -f 2)"
+          test -n "$asset_path"
+          curl --fail --silent --show-error \
+            "http://127.0.0.1:8080/${asset_path#/}" \
+            --output /tmp/frontend-asset
+          test -s /tmp/frontend-asset
+
+          curl --fail --silent --show-error \
+            http://127.0.0.1:8080/ci/client-route \
+            --output /tmp/frontend-route.html
+          cmp /tmp/frontend-index.html /tmp/frontend-route.html
       - name: Install Trivy
         run: |
           archive="$(mktemp)"

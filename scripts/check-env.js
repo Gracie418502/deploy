@@ -17,8 +17,9 @@
  *   --help     Print this help message
  *
  * Exit codes:
- *   0  All required variables are set and have non-placeholder values
- *   1  One or more variables are missing or contain placeholder values
+ *   0  Required variables are set, non-placeholder, and valid for the target
+ *   1  Variables are missing, contain placeholders, or have invalid URLs;
+ *      or command-line arguments are invalid
  *
  * Placeholder patterns detected:
  *   - Keys that match S[XXX...] (Stellar secret key template)
@@ -166,6 +167,22 @@ const TARGETS = {
   railway: RAILWAY_VARS,
 };
 
+const URL_PROTOCOLS = {
+  compose: {
+    SOROBAN_RPC_URL: ['http:', 'https:'],
+    SUPABASE_URL: ['http:', 'https:'],
+  },
+  k8s: {
+    SOROBAN_RPC_URL: ['https:'],
+    SUPABASE_URL: ['https:'],
+  },
+  railway: {
+    DATABASE_URL: ['postgres:', 'postgresql:'],
+    SOROBAN_RPC_URL: ['https:'],
+    SUPABASE_URL: ['https:'],
+  },
+};
+
 // ---------------------------------------------------------------------------
 // .env file parser
 // ---------------------------------------------------------------------------
@@ -186,24 +203,23 @@ export function parseEnvFile(filePath) {
   /** @type {Record<string, string>} */
   const env = {};
   for (const rawLine of content.split('\n')) {
-    const line = rawLine.trim();
+    let line = rawLine.trim();
     if (!line || line.startsWith('#')) continue;
+    if (/^export\s+/.test(line)) line = line.replace(/^export\s+/, '');
     const eqIdx = line.indexOf('=');
     if (eqIdx === -1) continue;
     const key = line.slice(0, eqIdx).trim();
     let value = line.slice(eqIdx + 1).trim();
-    // Strip inline comments (e.g. VALUE=foo  # comment)
-    // only if the value is not quoted
-    if (!value.startsWith('"') && !value.startsWith("'")) {
-      const commentIdx = value.indexOf(' #');
+    if (value.startsWith('"') || value.startsWith("'")) {
+      const quote = value[0];
+      const closingQuote = value.lastIndexOf(quote);
+      const trailing = value.slice(closingQuote + 1);
+      if (closingQuote > 0 && (!trailing || /^\s+#/.test(trailing))) {
+        value = value.slice(1, closingQuote);
+      }
+    } else {
+      const commentIdx = value.search(/\s+#/);
       if (commentIdx !== -1) value = value.slice(0, commentIdx).trim();
-    }
-    // Strip surrounding quotes
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
     }
     env[key] = value;
   }
@@ -219,6 +235,7 @@ export function parseEnvFile(filePath) {
  * @property {boolean}  ok
  * @property {string[]} missing     Variables not set at all
  * @property {string[]} placeholder Variables set to a placeholder value
+ * @property {string[]} invalidUrl  URL values with invalid syntax or protocols
  */
 
 /**
@@ -226,11 +243,13 @@ export function parseEnvFile(filePath) {
  *
  * @param {VarSpec[]}            specs
  * @param {Record<string,string>} fileEnv
+ * @param {'compose'|'k8s'|'railway'} target
  * @returns {ValidationResult}
  */
-export function validateEnv(specs, fileEnv) {
+export function validateEnv(specs, fileEnv, target) {
   const missing = [];
   const placeholder = [];
+  const invalidUrl = [];
 
   for (const spec of specs) {
     // process.env takes precedence over the file (mirrors how dotenv works in apps)
@@ -239,13 +258,26 @@ export function validateEnv(specs, fileEnv) {
       missing.push(spec.name);
     } else if (isPlaceholder(value)) {
       placeholder.push(spec.name);
+    } else {
+      const allowedProtocols = URL_PROTOCOLS[target][spec.name];
+      if (allowedProtocols) {
+        try {
+          const url = new URL(value);
+          if (!allowedProtocols.includes(url.protocol) || !url.hostname) {
+            invalidUrl.push(spec.name);
+          }
+        } catch {
+          invalidUrl.push(spec.name);
+        }
+      }
     }
   }
 
   return {
-    ok: missing.length === 0 && placeholder.length === 0,
+    ok: missing.length === 0 && placeholder.length === 0 && invalidUrl.length === 0,
     missing,
     placeholder,
+    invalidUrl,
   };
 }
 
@@ -269,13 +301,25 @@ export function parseArgs(argv) {
     if (arg === '--help' || arg === '-h') {
       help = true;
     } else if (arg === '--target' || arg === '-t') {
-      target = argv[++i] ?? target;
+      const value = argv[++i];
+      if (!value || value.startsWith('-')) {
+        throw new Error(`option "${arg}" requires a value`);
+      }
+      target = value;
     } else if (arg === '--env-file') {
-      envFile = argv[++i] ?? envFile;
+      const value = argv[++i];
+      if (!value || value.startsWith('-')) {
+        throw new Error(`option "${arg}" requires a value`);
+      }
+      envFile = value;
     } else if (arg.startsWith('--target=')) {
-      target = arg.split('=')[1];
+      target = arg.slice('--target='.length);
+      if (!target) throw new Error('option "--target" requires a value');
     } else if (arg.startsWith('--env-file=')) {
-      envFile = arg.split('=')[1];
+      envFile = arg.slice('--env-file='.length);
+      if (!envFile) throw new Error('option "--env-file" requires a value');
+    } else {
+      throw new Error(`unknown argument "${arg}"`);
     }
   }
 
@@ -302,7 +346,7 @@ Options:
 
 Exit codes:
   0  All checks passed
-  1  One or more variables are missing or contain placeholder values
+  1  Missing variables, placeholders, invalid URLs, or invalid arguments
 `.trim();
 
 /**
@@ -313,7 +357,14 @@ Exit codes:
  * @returns {number} Exit code
  */
 export function run(argv = process.argv.slice(2), cwd = process.cwd()) {
-  const { target, envFile, help } = parseArgs(argv);
+  let options;
+  try {
+    options = parseArgs(argv);
+  } catch (error) {
+    console.error(`check-env: ${error.message}`);
+    return 1;
+  }
+  const { target, envFile, help } = options;
 
   if (help) {
     console.log(HELP_TEXT);
@@ -332,7 +383,7 @@ export function run(argv = process.argv.slice(2), cwd = process.cwd()) {
   const fileEnv = parseEnvFile(resolvedEnvFile);
   const specs = TARGETS[target];
 
-  const { ok, missing, placeholder } = validateEnv(specs, fileEnv);
+  const { ok, missing, placeholder, invalidUrl } = validateEnv(specs, fileEnv, target);
 
   const targetLabel = target.toUpperCase();
 
@@ -367,6 +418,14 @@ export function run(argv = process.argv.slice(2), cwd = process.cwd()) {
       console.error(
         `  • ${name}="${displayValue}"${spec?.description ? `  — ${spec.description}` : ''}`
       );
+    }
+    console.error('');
+  }
+
+  if (invalidUrl.length > 0) {
+    console.error(`Invalid URL values (must use an allowed protocol):`);
+    for (const name of invalidUrl) {
+      console.error(`  • ${name} (allowed: ${URL_PROTOCOLS[target][name].join(', ')})`);
     }
     console.error('');
   }
