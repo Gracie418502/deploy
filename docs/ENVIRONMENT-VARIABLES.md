@@ -53,3 +53,12 @@ this list.
 - Non-secret values live in `k8s/configmap.yaml` and `.env.example`.
 - When adding a variable, update the backend reader, `.env.example`,
   `k8s/configmap.yaml` / `k8s/secrets.yaml`, and this document together.
+
+## URL validation in deployment checks
+
+`npm run check:env` parses URL-valued settings and applies protocol rules for
+each deployment target. The Compose target accepts `http://` and `https://`
+for `SOROBAN_RPC_URL` and `SUPABASE_URL`, including local development endpoints
+such as `http://localhost:54321`. Kubernetes and Railway require HTTPS for
+those two endpoints. Railway's `DATABASE_URL` must use `postgres://` or
+`postgresql://`.
