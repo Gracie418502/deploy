@@ -6,6 +6,12 @@ ARG NODE_VERSION=22
 # Override when upstream peer dependency conflicts are resolved.
 ARG NPM_FLAGS=--legacy-peer-deps
 
+# OCI image metadata (set at build time via --build-arg)
+ARG OCI_IMAGE_SOURCE=https://github.com/SynapsVault/frontend
+ARG OCI_IMAGE_REVISION=unknown
+ARG OCI_IMAGE_CREATED=unknown
+ARG OCI_IMAGE_VERSION=unknown
+
 # Stage 1: Build the Vite application
 FROM node:${NODE_VERSION}-alpine AS build
 ARG NPM_FLAGS
@@ -34,6 +40,18 @@ RUN npm run build
 # Stage 2: Serve static assets via nginx
 FROM nginx:1.31-alpine AS runtime
 
+# OCI image labels
+ARG OCI_IMAGE_SOURCE
+ARG OCI_IMAGE_REVISION
+ARG OCI_IMAGE_CREATED
+ARG OCI_IMAGE_VERSION
+LABEL org.opencontainers.image.source="${OCI_IMAGE_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_IMAGE_REVISION}" \
+      org.opencontainers.image.created="${OCI_IMAGE_CREATED}" \
+      org.opencontainers.image.version="${OCI_IMAGE_VERSION}" \
+      org.opencontainers.image.title="SynapsVault Frontend" \
+      org.opencontainers.image.description="Vite/React frontend for SynapsVault"
+
 # Serve the SPA on an unprivileged port; runtime config lives in writable /tmp.
 ## The variables below are intentionally literal until nginx or the container entrypoint reads them.
 # hadolint ignore=SC2016
@@ -47,9 +65,19 @@ RUN printf '%s\n' \
     '  fastcgi_temp_path /tmp/fastcgi_temp;' \
     '  uwsgi_temp_path /tmp/uwsgi_temp;' \
     '  scgi_temp_path /tmp/scgi_temp;' \
+    '  gzip on;' \
+    '  gzip_vary on;' \
+    '  gzip_min_length 1024;' \
+    '  gzip_types text/plain text/css text/xml text/javascript application/javascript application/json application/xml application/rss+xml application/atom+xml image/svg+xml;' \
     '  server {' \
     '    listen 8080;' \
     '    root /usr/share/nginx/html;' \
+    '    # Security headers' \
+    '    add_header X-Frame-Options "DENY" always;' \
+    '    add_header X-Content-Type-Options "nosniff" always;' \
+    '    add_header X-XSS-Protection "1; mode=block" always;' \
+    '    add_header Referrer-Policy "strict-origin-when-cross-origin" always;' \
+    '    add_header Content-Security-Policy "default-src '\''self'\''; script-src '\''self'\''; style-src '\''self'\'' '\''unsafe-inline'\''; img-src '\''self'\'' data:; font-src '\''self'\'' data:; connect-src '\''self'\''; frame-ancestors '\''none'\''; base-uri '\''self'\''; form-action '\''self'\'';" always;' \
     '    location = /config.js { alias /tmp/config.js; add_header Cache-Control "no-store"; }' \
     '    location / { try_files $uri $uri/ /index.html; }' \
     '  }' \

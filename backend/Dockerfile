@@ -11,6 +11,12 @@ ARG NODE_VERSION=22
 # Override when upstream peer dependency conflicts are resolved.
 ARG NPM_FLAGS=--legacy-peer-deps
 
+# OCI image metadata (set at build time via --build-arg)
+ARG OCI_IMAGE_SOURCE=https://github.com/SynapsVault/backend
+ARG OCI_IMAGE_REVISION=unknown
+ARG OCI_IMAGE_CREATED=unknown
+ARG OCI_IMAGE_VERSION=unknown
+
 # ---------- Stage 1: All dependencies (build + migrate tooling) ----------
 FROM node:${NODE_VERSION}-alpine AS deps
 ARG NPM_FLAGS
@@ -76,6 +82,19 @@ CMD ["npx", "--no-install", "drizzle-kit", "migrate"]
 
 # ---------- Target: runtime (default) ----------
 FROM node:${NODE_VERSION}-alpine AS runtime
+
+# OCI image labels
+ARG OCI_IMAGE_SOURCE
+ARG OCI_IMAGE_REVISION
+ARG OCI_IMAGE_CREATED
+ARG OCI_IMAGE_VERSION
+LABEL org.opencontainers.image.source="${OCI_IMAGE_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_IMAGE_REVISION}" \
+      org.opencontainers.image.created="${OCI_IMAGE_CREATED}" \
+      org.opencontainers.image.version="${OCI_IMAGE_VERSION}" \
+      org.opencontainers.image.title="SynapsVault Backend" \
+      org.opencontainers.image.description="Node.js/TypeScript API server for SynapsVault"
+
 WORKDIR /app
 
 # tini runs as PID 1 so it reaps zombies and forwards SIGTERM/SIGINT to Node,

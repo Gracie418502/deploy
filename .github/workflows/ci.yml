@@ -293,6 +293,7 @@ jobs:
           path: src
       - uses: docker/setup-buildx-action@v4
       - name: Build ${{ matrix.name }}
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ./src
@@ -303,6 +304,24 @@ jobs:
           tags: synapsvault/${{ matrix.name }}:ci
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          build-args: |
+            OCI_IMAGE_SOURCE=${{ matrix.name == 'frontend' && 'https://github.com/SynapsVault/frontend' || 'https://github.com/SynapsVault/backend' }}
+            OCI_IMAGE_REVISION=${{ matrix.name == 'frontend' && steps.refs.outputs.frontend || steps.refs.outputs.backend }}
+            OCI_IMAGE_CREATED=${{ github.event.pull_request.head.sha != '' && github.event.pull_request.head.sha || github.sha }}
+            OCI_IMAGE_VERSION=${{ github.ref_name == 'main' && 'latest' || github.ref_name }}
+      - name: Measure and report image size (frontend)
+        if: matrix.name == 'frontend'
+        run: |
+          # Get compressed size (what gets pushed to registry)
+          compressed_size=$(docker image inspect synapsvault/frontend:ci --format '{{.Size}}')
+          compressed_mb=$((compressed_size / 1024 / 1024))
+          echo "Frontend image compressed size: ${compressed_mb} MB (${compressed_size} bytes)"
+          echo "frontend-image-size-mb=${compressed_mb}" >> "$GITHUB_OUTPUT"
+          echo "frontend-image-size-bytes=${compressed_size}" >> "$GITHUB_OUTPUT"
+          # Budget check: warn if over 100MB
+          if [ ${compressed_mb} -gt 100 ]; then
+            echo "::warning::Frontend image size (${compressed_mb} MB) exceeds budget of 100 MB"
+          fi
       - name: Install Trivy
         run: |
           archive="$(mktemp)"
@@ -364,3 +383,8 @@ jobs:
           push: false
           cache-from: type=gha,scope=${{ matrix.name }}-main
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}-main
+          build-args: |
+            OCI_IMAGE_SOURCE=${{ matrix.name == 'frontend' && 'https://github.com/SynapsVault/frontend' || 'https://github.com/SynapsVault/backend' }}
+            OCI_IMAGE_REVISION=${{ github.sha }}
+            OCI_IMAGE_CREATED=${{ github.sha }}
+            OCI_IMAGE_VERSION=main
