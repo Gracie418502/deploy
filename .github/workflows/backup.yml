@@ -66,6 +66,13 @@ jobs:
           SOROBAN_CONTRACT_IDS: ${{ vars.SOROBAN_CONTRACT_IDS }}
           PROM_PUSHGATEWAY_URL: ${{ secrets.PROM_PUSHGATEWAY_URL }}
           BACKUP_RETENTION_DAYS: ${{ vars.BACKUP_RETENTION_DAYS || '30' }}
+          # Bound network operations so a hung RPC or object-storage call fails
+          # fast instead of stalling the job. Retries are capped and only apply
+          # to transient failures; invalid credentials fail immediately.
+          BACKUP_RPC_TIMEOUT_SECONDS: ${{ vars.BACKUP_RPC_TIMEOUT_SECONDS || '30' }}
+          BACKUP_RPC_MAX_RETRIES: ${{ vars.BACKUP_RPC_MAX_RETRIES || '3' }}
+          BACKUP_STORAGE_TIMEOUT_SECONDS: ${{ vars.BACKUP_STORAGE_TIMEOUT_SECONDS || '60' }}
+          BACKUP_STORAGE_MAX_RETRIES: ${{ vars.BACKUP_STORAGE_MAX_RETRIES || '3' }}
           BACKUP_OUTPUT_DIR: backups
           GIT_COMMIT: ${{ github.sha }}
           ENVIRONMENT: production
@@ -127,6 +134,10 @@ jobs:
           BACKUP_STORAGE_ACCESS_KEY_ID: ${{ secrets.BACKUP_STORAGE_ACCESS_KEY_ID }}
           BACKUP_STORAGE_SECRET_ACCESS_KEY: ${{ secrets.BACKUP_STORAGE_SECRET_ACCESS_KEY }}
           BACKUP_STORAGE_ENDPOINT: ${{ secrets.BACKUP_STORAGE_ENDPOINT }}
+          # Same bounded network policy as the backup job so verification
+          # exercises the deadline/retry behavior against object storage.
+          BACKUP_STORAGE_TIMEOUT_SECONDS: ${{ vars.BACKUP_STORAGE_TIMEOUT_SECONDS || '60' }}
+          BACKUP_STORAGE_MAX_RETRIES: ${{ vars.BACKUP_STORAGE_MAX_RETRIES || '3' }}
         run: bash scripts/restore.sh --verify-only
 
   notify-failure:

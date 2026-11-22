@@ -87,6 +87,21 @@ SOROBAN_NETWORK_PASSPHRASE="${SOROBAN_NETWORK_PASSPHRASE:-}"
 # Comma-separated list of contract IDs to snapshot.
 SOROBAN_CONTRACT_IDS="${SOROBAN_CONTRACT_IDS:-}"
 
+# Network deadlines and bounded retry policies.
+# Per-attempt deadline (seconds) for a single Soroban RPC request.
+BACKUP_RPC_TIMEOUT_SECONDS="${BACKUP_RPC_TIMEOUT_SECONDS:-${SOROBAN_RPC_TIMEOUT:-30}}"
+# Maximum number of retries (in addition to the first attempt) for RPC calls.
+BACKUP_RPC_MAX_RETRIES="${BACKUP_RPC_MAX_RETRIES:-3}"
+# Per-attempt deadline (seconds) for a single object-storage upload.
+BACKUP_STORAGE_TIMEOUT_SECONDS="${BACKUP_STORAGE_TIMEOUT_SECONDS:-${BACKUP_UPLOAD_TIMEOUT:-300}}"
+# Maximum number of retries (in addition to the first attempt) for uploads.
+BACKUP_STORAGE_MAX_RETRIES="${BACKUP_STORAGE_MAX_RETRIES:-3}"
+# Base delay (seconds) for exponential backoff between retries.
+BACKUP_RETRY_BACKOFF_SECONDS="${BACKUP_RETRY_BACKOFF_SECONDS:-2}"
+# Upper bound (seconds) on any single backoff sleep.
+BACKUP_RETRY_MAX_BACKOFF_SECONDS="${BACKUP_RETRY_MAX_BACKOFF_SECONDS:-30}"
+=======
+
 # Optional: path to a file containing additional contract IDs (one per line).
 SOROBAN_CONTRACT_IDS_FILE="${SOROBAN_CONTRACT_IDS_FILE:-}"
 
@@ -302,6 +317,88 @@ previous_last_success() {
 }
 
 # ---------------------------------------------------------------------------
+# Retry helper
+# ---------------------------------------------------------------------------
+
+# Classify a failure as transient (retryable) or permanent (fail fast).
+# Arguments: exit code, and a text blob (stderr / response) to inspect.
+# Returns 0 if the failure is transient, 1 if it is permanent.
+is_transient_failure() {
+  local exit_code="$1"
+  local detail="${2:-}"
+
+  # Authentication / authorization failures must never be retried: retrying
+  # invalid credentials only delays the inevitable and can lock accounts.
+  if [[ "${detail}" =~ (401|403|Unauthorized|Forbidden|AccessDenied|AccessDeniedException|InvalidAccessKeyId|SignatureDoesNotMatch|InvalidToken|invalid_grant|authentication failed|password authentication failed) ]]; then
+    return 1
+  fi
+
+  # HTTP 5xx responses are transient.
+  if [[ "${detail}" =~ (HTTP[^0-9]*5[0-9][0-9]|status[^0-9]*5[0-9][0-9]|"status":[[:space:]]*5[0-9][0-9]) ]]; then
+    return 0
+  fi
+
+  # curl exit codes: 6 (resolve), 7 (connect), 28 (timeout), 35 (TLS), 52 (empty reply), 56 (recv).
+  case "${exit_code}" in
+    6|7|28|35|52|56) return 0 ;;
+  esac
+
+  # AWS CLI / generic transient markers.
+  if [[ "${detail}" =~ (timed?\ out|timeout|connection\ reset|connection\ refused|temporarily\ unavailable|ServiceUnavailable|SlowDown|RequestTimeout|Throttl|ECONNRESET|ETIMEDOUT|network) ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+# Run a command with bounded exponential backoff, retrying only transient
+# failures. Usage: retry_with_backoff <max_retries> <label> <cmd...>
+retry_with_backoff() {
+  local max_retries="$1"; shift
+  local label="$1"; shift
+
+  local attempt=0
+  local rc=0
+  local err_file
+  err_file="$(mktemp "${WORK_DIR}/retry.XXXXXX" 2>/dev/null || mktemp)"
+
+  while :; do
+    rc=0
+    "$@" 2>"${err_file}" || rc=$?
+
+    if [[ "${rc}" -eq 0 ]]; then
+      rm -f "${err_file}"
+      return 0
+    fi
+
+    local detail
+    detail="$(cat "${err_file}" 2>/dev/null || true)"
+
+    if ! is_transient_failure "${rc}" "${detail}"; then
+      error "${label} failed with a non-retryable error (exit ${rc})"
+      [[ -n "${detail}" ]] && printf '%s\n' "${detail}" >&2
+      rm -f "${err_file}"
+      return "${rc}"
+    fi
+
+    if [[ "${attempt}" -ge "${max_retries}" ]]; then
+      error "${label} failed after ${attempt} retries (exit ${rc})"
+      [[ -n "${detail}" ]] && printf '%s\n' "${detail}" >&2
+      rm -f "${err_file}"
+      return "${rc}"
+    fi
+
+    local delay=$(( BACKUP_RETRY_BACKOFF_SECONDS * (1 << attempt) ))
+    if [[ "${delay}" -gt "${BACKUP_RETRY_MAX_BACKOFF_SECONDS}" ]]; then
+      delay="${BACKUP_RETRY_MAX_BACKOFF_SECONDS}"
+    fi
+    warn "${label} failed transiently (exit ${rc}); retry $(( attempt + 1 ))/${max_retries} in ${delay}s"
+    sleep "${delay}"
+    attempt=$(( attempt + 1 ))
+  done
+}
+
+# ---------------------------------------------------------------------------
 # Database dump
 # ---------------------------------------------------------------------------
 
@@ -318,6 +415,14 @@ dump_database() {
 
   info "Dumping Postgres database"
   local dump_path="${out_dir}/database.sql.gz"
+
+  # Capture client and server version metadata for the manifest.
+  PG_DUMP_VERSION="$(pg_dump --version 2>/dev/null | head -n1 || true)"
+  PG_SERVER_VERSION="$(psql "${DATABASE_URL}" -X -At -v ON_ERROR_STOP=1 -c 'SHOW server_version;' 2>/dev/null | head -n1 || true)"
+  if [[ -z "${PG_SERVER_VERSION}" ]]; then
+    warn "Could not determine PostgreSQL server version"
+  fi
+  debug "pg_dump: ${PG_DUMP_VERSION:-unknown}; server: ${PG_SERVER_VERSION:-unknown}"
 
   # Plain SQL with DROP ... IF EXISTS statements so restore.sh can replay it
   # onto an existing database with psql. pg_dump writes to stdout so we can
@@ -377,12 +482,14 @@ soroban_rpc_call() {
   local payload
   payload="$(printf '{"jsonrpc":"2.0","id":1,"method":"%s","params":%s}' "${method}" "${params}")"
 
-  curl -fsS \
-    -X POST \
-    -H 'Content-Type: application/json' \
-    --max-time "${SOROBAN_RPC_TIMEOUT:-30}" \
-    --data "${payload}" \
-    "${SOROBAN_RPC_URL}"
+  retry_with_backoff "${BACKUP_RPC_MAX_RETRIES}" "Soroban RPC ${method}" \
+    curl -fsS \
+      -X POST \
+      -H 'Content-Type: application/json' \
+      --connect-timeout "${BACKUP_RPC_TIMEOUT_SECONDS}" \
+      --max-time "${BACKUP_RPC_TIMEOUT_SECONDS}" \
+      --data "${payload}" \
+      "${SOROBAN_RPC_URL}"
 }
 
 # Fetch the latest ledger entries for a contract's instance and persistent storage.
@@ -587,10 +694,14 @@ upload_s3() {
     args+=(--endpoint-url "${BACKUP_STORAGE_ENDPOINT%/}")
   fi
 
-  AWS_ACCESS_KEY_ID="${BACKUP_STORAGE_ACCESS_KEY_ID:-${AWS_ACCESS_KEY_ID:-}}" \
-  AWS_SECRET_ACCESS_KEY="${BACKUP_STORAGE_SECRET_ACCESS_KEY:-${AWS_SECRET_ACCESS_KEY:-}}" \
-  AWS_SESSION_TOKEN="${BACKUP_STORAGE_SESSION_TOKEN:-${AWS_SESSION_TOKEN:-}}" \
-    aws s3 cp "${args[@]}" "${file}" "s3://${BACKUP_STORAGE_BUCKET}/${key}"
+  retry_with_backoff "${BACKUP_STORAGE_MAX_RETRIES}" "S3 upload ${key}" \
+    env \
+      AWS_ACCESS_KEY_ID="${BACKUP_STORAGE_ACCESS_KEY_ID:-${AWS_ACCESS_KEY_ID:-}}" \
+      AWS_SECRET_ACCESS_KEY="${BACKUP_STORAGE_SECRET_ACCESS_KEY:-${AWS_SECRET_ACCESS_KEY:-}}" \
+      AWS_SESSION_TOKEN="${BACKUP_STORAGE_SESSION_TOKEN:-${AWS_SESSION_TOKEN:-}}" \
+      AWS_CLI_READ_TIMEOUT="${BACKUP_STORAGE_TIMEOUT_SECONDS}" \
+      AWS_CLI_CONNECT_TIMEOUT="${BACKUP_STORAGE_TIMEOUT_SECONDS}" \
+      aws s3 cp "${args[@]}" "${file}" "s3://${BACKUP_STORAGE_BUCKET}/${key}"
 }
 
 # Upload a file to Supabase Storage using its REST API.
@@ -605,14 +716,16 @@ upload_supabase() {
   local url="${BACKUP_STORAGE_SUPABASE_URL%/}/storage/v1/object/${BACKUP_STORAGE_BUCKET}/${key}"
   local content_type="application/octet-stream"
 
-  curl -fsS \
-    -X POST \
-    -H "Authorization: Bearer ${BACKUP_STORAGE_SUPABASE_SERVICE_KEY}" \
-    -H "Content-Type: ${content_type}" \
-    -H "x-upsert: true" \
-    --data-binary "@${file}" \
-    --max-time "${BACKUP_UPLOAD_TIMEOUT:-300}" \
-    "${url}" >/dev/null
+  retry_with_backoff "${BACKUP_STORAGE_MAX_RETRIES}" "Supabase upload ${key}" \
+    curl -fsS \
+      -X POST \
+      -H "Authorization: Bearer ${BACKUP_STORAGE_SUPABASE_SERVICE_KEY}" \
+      -H "Content-Type: ${content_type}" \
+      -H "x-upsert: true" \
+      --data-binary "@${file}" \
+      --connect-timeout "${BACKUP_STORAGE_TIMEOUT_SECONDS}" \
+      --max-time "${BACKUP_STORAGE_TIMEOUT_SECONDS}" \
+      "${url}"
 }
 
 upload_artifact() {
@@ -654,6 +767,9 @@ json_escape() {
   printf '%s' "${s}"
 }
 
+# Schema version for the manifest format. Bump when fields change shape.
+BACKUP_MANIFEST_SCHEMA_VERSION="${BACKUP_MANIFEST_SCHEMA_VERSION:-1}"
+
 write_manifest() {
   local encrypted_file="$1"
   local checksum="$2"
@@ -661,6 +777,8 @@ write_manifest() {
   local object_key="$4"
   local db_included="$5"
   local contracts_included="$6"
+  local db_checksum="${7:-}"
+  local contracts_checksum="${8:-}"
 
   local hostname
   hostname="$(hostname 2>/dev/null || echo unknown)"
@@ -671,6 +789,7 @@ write_manifest() {
 
   cat > "${MANIFEST_PATH}" <<EOF
 {
+  "schemaVersion": ${BACKUP_MANIFEST_SCHEMA_VERSION},
   "name": "$(json_escape "${BACKUP_NAME}")",
   "timestamp": "$(json_escape "${BACKUP_DATE_ISO}")",
   "timestampEpoch": $(date -u +%s),
@@ -696,6 +815,14 @@ write_manifest() {
     "contractsIncluded": ${contracts_included},
     "sorobanRpcUrl": "$(json_escape "${SOROBAN_RPC_URL}")",
     "sorobanNetworkPassphrase": "$(json_escape "${SOROBAN_NETWORK_PASSPHRASE}")"
+  },
+  "versions": {
+    "postgresServer": "$(json_escape "${PG_SERVER_VERSION:-}")",
+    "pgDumpClient": "$(json_escape "${PG_DUMP_VERSION:-}")"
+  },
+  "componentChecksums": {
+    "database": "$(json_escape "${db_checksum}")",
+    "contracts": "$(json_escape "${contracts_checksum}")"
   },
   "artifacts": {
     "archive": "$(json_escape "${BACKUP_NAME}.tar.gz")",
@@ -743,6 +870,15 @@ main() {
   local size_bytes
   size_bytes="$(stat -c '%s' "${ENCRYPTED_PATH}" 2>/dev/null || stat -f '%z' "${ENCRYPTED_PATH}")"
 
+  # Per-component checksums (database dump and contract snapshot).
+  local db_checksum="" contracts_checksum=""
+  if [[ -f "${staging_dir}/database.sql.gz" ]]; then
+    db_checksum="$(sha256sum "${staging_dir}/database.sql.gz" | awk '{print $1}')"
+  fi
+  if [[ -d "${staging_dir}/contracts" ]]; then
+    contracts_checksum="$(cd "${staging_dir}" && tar --sort=name -cf - contracts 2>/dev/null | sha256sum | awk '{print $1}')"
+  fi
+
   # 6. Upload encrypted archive + manifest.
   local encrypted_key
   encrypted_key="$(object_key_for "$(basename "${ENCRYPTED_PATH}")")"
@@ -753,7 +889,8 @@ main() {
   [[ "${BACKUP_SKIP_CONTRACTS}" != "1" ]] && contracts_included="true"
 
   write_manifest "${ENCRYPTED_PATH}" "${checksum}" "${size_bytes}" \
-    "${encrypted_key}" "${db_included}" "${contracts_included}"
+    "${encrypted_key}" "${db_included}" "${contracts_included}" \
+    "${db_checksum}" "${contracts_checksum}"
 
   upload_artifact "${ENCRYPTED_PATH}" "${encrypted_key}"
 
