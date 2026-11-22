@@ -46,6 +46,28 @@ this list.
 | `CORS_ORIGIN` | no | Allowed frontend origin(s). |
 | `NEXT_PUBLIC_API_URL` | no | Backend base URL consumed by the frontend. |
 
+## Frontend runtime config
+
+These variables are read by the frontend container entrypoint at startup and
+rendered into `/config.js`, which the browser loads before the app bundle.
+
+| Variable | Secret | Description |
+| --- | --- | --- |
+| `APP_API_URL` | no | Backend base URL used by the frontend. Accepts a relative path starting with `/` (e.g. `/api`) or an absolute `http://` / `https://` URL. |
+| `APP_NETWORK` | no | Stellar network the frontend targets. Must be one of the supported network names (`testnet`, `mainnet`). |
+| `APP_SENTRY_DSN` | no | Optional Sentry DSN for frontend error reporting. Leave empty to disable. |
+
+Validation rules:
+
+- `APP_API_URL` and `APP_NETWORK` are required. If either is missing or
+  invalid, the container exits at startup with a field-level message naming the
+  offending variable (e.g. `APP_API_URL must be a relative path starting with
+  "/" or an absolute http(s) URL`).
+- `APP_SENTRY_DSN` is optional; when set it must be a valid `http(s)` URL.
+- Values are escaped when rendered into `/config.js`, so quotes, backslashes,
+  line breaks and script-like strings are preserved as string literals and
+  cannot break out of the generated JavaScript.
+
 ## Notes
 
 - Secret values live only in `k8s/secrets.yaml` (or your secret manager) and
