@@ -333,6 +333,7 @@ The alert rules in [`monitoring/alert-rules.yml`](../monitoring/alert-rules.yml)
 | `db_connection_pool_*` | Database connection pool saturation and exhaustion alerts |
 | `stellar_rpc_*` | Stellar RPC latency, error rate, and availability alerts |
 | `soroban_rpc_*` | Soroban RPC latency, error rate, and availability alerts |
+| `build_info{version="..."}` | Release revision shown on the dashboard version panel |
 
 Verify each family is exported before relying on the alerts:
 
@@ -343,6 +344,63 @@ curl -s http://localhost:3000/metrics \
 ```
 
 If a family is absent, the backend is missing instrumentation for it. Open an issue in the backend repository (`SynapsVault/backend`) to add the missing metrics. The alert rules include `absent()` checks that fire when a required metric family is not exported, so missing instrumentation surfaces as an alert rather than failing silently.
+
+## Availability objectives and burn-rate alerts
+
+The service availability objective is defined in
+[`monitoring/alert-rules.yml`](../monitoring/alert-rules.yml) as a recording
+rule (`slo:availability:ratio`) computed from the backend request counters:
+
+- **Objective:** 99.9% of requests succeed over a 30-day window (an error
+  budget of 0.1%).
+- **Fast burn:** a 1-hour window consuming error budget at 14.4× the sustainable
+  rate (2% of the 30-day budget in one hour) pages immediately.
+- **Slow burn:** a 6-hour window consuming error budget at 6× the sustainable
+  rate (5% of the 30-day budget in six hours) opens a ticket.
+
+Both alerts require a matching long window (5m for fast, 30m for slow) to be
+burning as well, so a single short spike does not page. The rules use
+`and on(job)` between the short and long windows.
+
+**Low-traffic behavior:** the burn-rate expressions are guarded by a minimum
+request-rate condition (e.g. `sum(rate(http_requests_total[5m])) > 0.1`). When
+traffic is too low to make the ratio meaningful, the alerts stay silent instead
+of firing on a handful of failed requests. Verify this with the synthetic
+fixtures in [`monitoring/tests/`](../monitoring/tests) — they cover fast burn,
+slow burn, and low-traffic cases.
+
+## Release revision and dashboard version panel
+
+The Grafana dashboard includes a **Deployed version** panel that shows the
+running release revision per environment. It reads the `version` label from the
+backend's `build_info` metric:
+
+```promql
+max by (environment, version) (build_info)
+```
+
+The backend must export `build_info{version="<git-sha-or-tag>",environment="<env>"} 1`
+at startup. If your deployment uses annotations instead, add a Grafana
+annotation querying the same metric and keep the label names consistent.
+
+To view the deployed version per environment:
+
+1. Open the dashboard and check the **Deployed version** panel (one row per
+   `environment` label value).
+2. Or query Prometheus directly:
+
+   ```bash
+   curl -s 'http://localhost:9090/api/v1/query?query=max%20by%20(environment,%20version)%20(build_info)'
+   ```
+
+## Stable dashboard and datasource UIDs
+
+The provisioned dashboard and datasource use fixed UIDs
+(`synapsvault-overview` for the dashboard, `prometheus` for the datasource) so
+that links and panel references survive recreation. Reprovisioning (restarting
+Grafana or re-applying the ConfigMap) updates the existing dashboard in place
+instead of creating duplicates. If you import the dashboard manually, keep the
+`uid` field from the JSON so links remain stable.
 
 ## Troubleshooting
 
@@ -371,6 +429,9 @@ Route alerts to the receivers under `route:` and reload Alertmanager (or restart
 - The `PrometheusRule` mirrors `monitoring/alert-rules.yml`. When you change the
   alert rules, update both files (or regenerate the `PrometheusRule` from the
   YAML) so Kubernetes and docker-compose stay consistent.
+- The dashboard and datasource UIDs are stable; reprovisioning updates the
+  existing dashboard rather than creating duplicates. Do not change the `uid`
+  fields unless you also update every link that references them.
 - **Monitoring containers not started:** they are behind the `monitoring` profile. Start them with `docker compose --profile monitoring up -d`.
 - **Prometheus target down:** verify the backend metrics endpoint is reachable from the Prometheus container and the scrape target host/port is correct.
 - **No alerts delivered:** check Alertmanager logs (`docker compose --profile monitoring logs alertmanager`) and confirm receiver credentials and routing are correct.

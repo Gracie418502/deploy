@@ -84,3 +84,73 @@ tests:
       - eval_time: 30m
         alertname: BackupStale
         exp_alerts: []
+
+  # Fast burn: sustained high error ratio over the short window.
+  - interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="backend",status="500"}'
+        values: '0+60x10'
+      - series: 'http_requests_total{job="backend",status="200"}'
+        values: '0+540x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: BackendErrorBudgetFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              team: backend
+              job: backend
+            exp_annotations:
+              summary: Backend is burning its error budget quickly
+              description: Backend is consuming its error budget at a fast rate over the short window.
+              runbook_url: https://github.com/example/soroban-backend/blob/main/docs/runbooks/error-budget-burn.md
+
+  # Slow burn: sustained moderate error ratio over the long window.
+  - interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="backend",status="500"}'
+        values: '0+6x70'
+      - series: 'http_requests_total{job="backend",status="200"}'
+        values: '0+594x70'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: BackendErrorBudgetSlowBurn
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: backend
+              job: backend
+            exp_annotations:
+              summary: Backend is burning its error budget steadily
+              description: Backend is consuming its error budget at a slow but sustained rate over the long window.
+              runbook_url: https://github.com/example/soroban-backend/blob/main/docs/runbooks/error-budget-burn.md
+
+  # Normal error ratio: neither burn alert fires.
+  - interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="backend",status="500"}'
+        values: '0+1x70'
+      - series: 'http_requests_total{job="backend",status="200"}'
+        values: '0+999x70'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: BackendErrorBudgetFastBurn
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: BackendErrorBudgetSlowBurn
+        exp_alerts: []
+
+  # Low traffic: high error ratio but request volume below the minimum, so no alert.
+  - interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="backend",status="500"}'
+        values: '0+1x70'
+      - series: 'http_requests_total{job="backend",status="200"}'
+        values: '0+0x70'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: BackendErrorBudgetFastBurn
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: BackendErrorBudgetSlowBurn
+        exp_alerts: []

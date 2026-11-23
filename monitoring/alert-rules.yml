@@ -343,6 +343,88 @@ groups:
           description: "More than 5% of Soroban RPC requests have failed over the last 5 minutes."
           runbook_url: "https://docs.example.com/runbooks/soroban-rpc"
 
+  - name: service-availability-slo
+    rules:
+      # Service availability objective: 99.9% of backend HTTP requests succeed
+      # (non-5xx) over a 30-day rolling window. Error budget = 0.1%.
+      - record: slo:backend_http_availability:ratio
+        expr: |
+          (
+            sum(rate(http_requests_total{job="backend", status!~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{job="backend"}[5m]))
+          )
+        labels:
+          slo: backend-http-availability
+          objective: "0.999"
+
+      - record: slo:backend_http_error_ratio:ratio
+        expr: |
+          (
+            sum(rate(http_requests_total{job="backend", status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{job="backend"}[5m]))
+          )
+        labels:
+          slo: backend-http-availability
+          objective: "0.999"
+
+      # Multi-window, multi-burn-rate alerts.
+      # Error budget burn rate = error_ratio / (1 - objective) = error_ratio / 0.001.
+      # Fast burn: 14.4x budget over 1h (long) and 5m (short) windows.
+      - alert: BackendAvailabilityErrorBudgetFastBurn
+        expr: |
+          (
+            sum(rate(http_requests_total{job="backend", status=~"5.."}[1h]))
+            /
+            sum(rate(http_requests_total{job="backend"}[1h]))
+          ) > (14.4 * 0.001)
+          and
+          (
+            sum(rate(http_requests_total{job="backend", status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{job="backend"}[5m]))
+          ) > (14.4 * 0.001)
+          and
+          sum(rate(http_requests_total{job="backend"}[5m])) > 1
+        for: 2m
+        labels:
+          severity: critical
+          team: backend
+          slo: backend-http-availability
+          burn_rate: fast
+        annotations:
+          summary: "Backend availability error budget is burning fast ({{ $value | humanizePercentage }} error ratio)"
+          description: "The backend is consuming its 99.9% availability error budget at more than 14.4x the sustainable rate over both the 1h and 5m windows. At this rate the 30-day budget would be exhausted in under ~2 days."
+          runbook_url: "https://github.com/example/soroban-backend/blob/main/docs/runbooks/error-budget-burn.md"
+
+      # Slow burn: 6x budget over 6h (long) and 30m (short) windows.
+      - alert: BackendAvailabilityErrorBudgetSlowBurn
+        expr: |
+          (
+            sum(rate(http_requests_total{job="backend", status=~"5.."}[6h]))
+            /
+            sum(rate(http_requests_total{job="backend"}[6h]))
+          ) > (6 * 0.001)
+          and
+          (
+            sum(rate(http_requests_total{job="backend", status=~"5.."}[30m]))
+            /
+            sum(rate(http_requests_total{job="backend"}[30m]))
+          ) > (6 * 0.001)
+          and
+          sum(rate(http_requests_total{job="backend"}[30m])) > 1
+        for: 15m
+        labels:
+          severity: warning
+          team: backend
+          slo: backend-http-availability
+          burn_rate: slow
+        annotations:
+          summary: "Backend availability error budget is burning slowly ({{ $value | humanizePercentage }} error ratio)"
+          description: "The backend is consuming its 99.9% availability error budget at more than 6x the sustainable rate over both the 6h and 30m windows. At this rate the 30-day budget would be exhausted in under ~5 days."
+          runbook_url: "https://github.com/example/soroban-backend/blob/main/docs/runbooks/error-budget-burn.md"
+
   - name: metrics-instrumentation
     rules:
       - alert: DatabaseConnectionPoolMetricsMissing
