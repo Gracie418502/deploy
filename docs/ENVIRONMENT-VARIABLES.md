@@ -84,3 +84,19 @@ for `SOROBAN_RPC_URL` and `SUPABASE_URL`, including local development endpoints
 such as `http://localhost:54321`. Kubernetes and Railway require HTTPS for
 those two endpoints. Railway's `DATABASE_URL` must use `postgres://` or
 `postgresql://`.
+
+## Smoke-test configuration
+
+`scripts/06-smoke-test.js` validates its configuration before making any
+network calls. Invalid settings fail fast with a redacted configuration error
+(secret values are never echoed).
+
+| Variable | Secret | Description |
+| --- | --- | --- |
+| `SMOKE_BASE_URL` | no | Base URL of the deployed backend. Parsed and normalized, so a trailing slash does not produce double-slash requests. A root base URL (`https://api.example.com`) and a path prefix (`https://api.example.com/api`) are both supported; the prefix is preserved when endpoint paths are joined. |
+| `SMOKE_READY_TIMEOUT_MS` | no | Readiness polling timeout in milliseconds. Must be a finite, positive number; nonfinite, negative and zero values are rejected. |
+| `ADMIN_API_KEY` | **yes** | Admin API key used for authenticated endpoint checks. Must be explicitly set and must not be a placeholder (e.g. `change_me`); missing or placeholder values are rejected. |
+
+Authenticated endpoint checks use an explicit redirect policy: redirects are
+not followed across origins. A cross-origin redirect fails the check without
+forwarding the `X-Admin-Key` header to the redirected origin.
