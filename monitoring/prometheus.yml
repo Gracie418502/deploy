@@ -33,6 +33,13 @@ scrape_configs:
           service: 'prometheus'
           tier: 'monitoring'
 
+  # The backend exposes the running release revision via the build_info gauge
+  # (see backend metrics instrumentation):
+  #   synapsvault_build_info{version="<git sha or tag>",environment="<env>"} 1
+  # The Grafana "Deployment Version" panel reads this metric (grouped by
+  # environment) to correlate incidents with releases. The environment label
+  # is also attached here as a scrape-time label so the panel can show the
+  # deployed version per environment even if the app omits it.
   - job_name: 'backend'
     metrics_path: '/metrics'
     scheme: 'http'
@@ -41,11 +48,17 @@ scrape_configs:
         labels:
           service: 'synapsvault-backend'
           tier: 'application'
+          environment: '${PROMETHEUS_ENVIRONMENT:-local}'
     relabel_configs:
       - source_labels: [__address__]
         target_label: instance
         regex: '([^:]+)(?::\d+)?'
         replacement: '${1}'
+      # Keep the release revision visible on every backend series so the
+      # dashboard can join service health with the deployed version.
+      - source_labels: [__meta_kubernetes_pod_label_version]
+        target_label: version
+        regex: '(.+)'
 
   - job_name: 'database'
     scrape_interval: 30s

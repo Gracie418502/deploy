@@ -2,11 +2,32 @@ apiVersion: 1
 
 # monitoring/grafana-dashboard.json is mounted into this folder by
 # docker-compose.yml.
+#
+# Stable identifiers:
+#   - The dashboard JSON (monitoring/grafana-dashboard.json) declares a fixed
+#     top-level "uid" (e.g. "synapsvault-overview"). Grafana keys dashboards by
+#     this UID, so reprovisioning updates the existing dashboard in place
+#     instead of creating duplicates. Do not change it without updating links.
+#   - The Prometheus datasource is provisioned with a fixed "uid: prometheus"
+#     (see monitoring/grafana/provisioning/datasources/datasources.yml). The
+#     dashboard's datasource references must match that UID exactly so panels
+#     keep resolving after recreation.
+#
+# Folder/UID mapping: all dashboards from this provider land in the
+# "SynapsVault" folder; the stable dashboard UID is independent of the folder
+# and is what preserves links across recreation.
 providers:
   - name: synapsvault
     folder: SynapsVault
     type: file
+    # Keep deletion enabled so removed dashboard files are cleaned up, but the
+    # stable dashboard UID ensures re-applying the same file updates in place.
     disableDeletion: false
+    # Allow UI edits; the file remains the source of truth on reprovisioning,
+    # and the stable UID prevents duplicate dashboards from being created.
     allowUiUpdates: true
     options:
       path: /var/lib/grafana/dashboards
+      # Folders from disk are not created; dashboards are placed in the
+      # configured "SynapsVault" folder above.
+      foldersFromFilesStructure: false

@@ -447,12 +447,78 @@
       "type": "stat"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Running release revision per environment/instance, sourced from the build_info metric (label: revision). Correlate incidents with releases by comparing this against the Uptime panel.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 17
+      },
+      "id": 9,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "build_info{job=\"backend\"}",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{environment}} {{instance}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Deployed Version",
+      "type": "stat"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 17
+        "y": 25
       },
       "id": 101,
       "panels": [],
@@ -519,8 +585,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
-        "y": 18
+        "x": 12,
+        "y": 25
       },
       "id": 5,
       "options": {
@@ -636,8 +702,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 18
+        "x": 0,
+        "y": 33
       },
       "id": 6,
       "options": {
@@ -699,7 +765,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 26
+        "y": 41
       },
       "id": 102,
       "panels": [],
@@ -798,7 +864,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 27
+        "y": 42
       },
       "id": 7,
       "options": {
@@ -881,7 +947,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 27
+        "y": 42
       },
       "id": 8,
       "options": {
@@ -953,7 +1019,7 @@
   "timepicker": {},
   "timezone": "browser",
   "title": "Backend & x402 Payments",
-  "uid": "backend-x402-overview",
+  "uid": "synapsvault-overview",
   "version": 1,
   "weekStart": ""
 }

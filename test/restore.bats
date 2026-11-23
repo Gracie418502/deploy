@@ -531,9 +531,57 @@ EOF
   [[ "$output" == *"30s"* ]]
 }
 
+@test "verify_role_grants fails when the application role lacks table privileges" {
+  # Stub psql so has_table_privilege reports false for every required table.
+  psql() {
+    local query=""
+    for arg in "$@"; do
+      query="$arg"
+    done
+    if [[ "$query" == *"has_table_privilege"* ]]; then
+      printf 'f\n'
+    else
+      printf 't\n'
+    fi
+    return 0
+  }
+  export -f psql
+
+  run verify_role_grants "postgres://localhost/restore_verify" "app_role" "public.accounts public.contracts"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"app_role"* ]]
+  [[ "$output" == *"accounts"* || "$output" == *"privilege"* ]]
+}
+
+@test "verify_role_grants passes when the application role has table privileges" {
+  # Stub psql so has_table_privilege reports true for every required table.
+  psql() {
+    local query=""
+    for arg in "$@"; do
+      query="$arg"
+    done
+    if [[ "$query" == *"has_table_privilege"* ]]; then
+      printf 't\n'
+    else
+      printf 't\n'
+    fi
+    return 0
+  }
+  export -f psql
+
+  run verify_role_grants "postgres://localhost/restore_verify" "app_role" "public.accounts public.contracts"
+  [ "$status" -eq 0 ]
+}
+
 @test "restore.sh --help exits 0" {
   run "$REPO_ROOT/scripts/restore.sh" --help
   [ "$status" -eq 0 ]
+}
+
+@test "restore.sh --help documents the role grant verification flag" {
+  run "$REPO_ROOT/scripts/restore.sh" --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"--verify-role-grants"* ]]
 }
 
 @test "restore.sh rejects an unknown flag" {

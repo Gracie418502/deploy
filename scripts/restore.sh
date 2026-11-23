@@ -22,7 +22,9 @@
 #                          is a PostgreSQL .sql script, NOT the on-chain JSON
 #                          snapshots under contracts/ in the backup archive.
 #   --skip-contract-state  Do not apply CONTRACT_STATE_FILE / --post-restore-sql
-#   --skip-contract-state  Do not re-apply CONTRACT_STATE_FILE after restore
+#   --verify-grants        After restore, verify the application role can access
+#                          every restored table (SELECT/INSERT/UPDATE/DELETE).
+#                          Requires APP_DB_ROLE. Never grants privileges itself.
 #   --audit-report <path>  Write a sanitized JSON restore audit report to <path>
 #                          (default: $RESTORE_AUDIT_REPORT, if set)
 #   -y, --yes              Skip interactive confirmation when restoring over a
@@ -46,6 +48,9 @@
 #                                    (e.g. to update contract ID rows in DB;
 #                                    for repointing env/ConfigMap contract IDs,
 #                                    use scripts/rollback-contracts.cjs instead)
+#   APP_DB_ROLE                      Application role checked by --verify-grants
+#                                    (dumps omit ownership/grants, so this
+#                                    confirms the role can still reach tables)
 #   RESTORE_MAX_MEMBERS              Maximum number of archive members allowed
 #                                    (default: 10000). Archives with more
 #                                    members are rejected before extraction.
@@ -75,7 +80,7 @@
 #   2  download or checksum failure
 #   3  decryption failure
 #   4  restore failure
-#   5  verification mismatch
+#   5  verification mismatch (table list or application role grants)
 #   6  pre-flight check failed (missing extensions / permissions / lock timeout)
 #
 set -euo pipefail
@@ -93,7 +98,7 @@ die() {
 }
 
 usage() {
-  sed -n '2,51p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,56p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # Read a string field from the manifest written by backup.sh. The manifest has
@@ -310,6 +315,7 @@ WORK_DIR=""
 KEEP_WORK_DIR="false"
 SKIP_CONTRACT_STATE="false"
 POST_RESTORE_SQL_ARG=""
+VERIFY_GRANTS="false"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -353,6 +359,10 @@ while [[ $# -gt 0 ]]; do
       SKIP_CONTRACT_STATE="true"
       shift
       ;;
+    --verify-grants)
+      VERIFY_GRANTS="true"
+      shift
+      ;;
     --audit-report)
       [[ $# -ge 2 ]] || die 1 "--audit-report requires a path"
       AUDIT_REPORT_PATH="$2"
@@ -392,6 +402,7 @@ SUPABASE_SERVICE_KEY="${BACKUP_STORAGE_SUPABASE_SERVICE_KEY:-}"
 BACKUP_ENCRYPTION_KEY="${BACKUP_ENCRYPTION_KEY:-}"
 BACKUP_AGE_IDENTITY_FILE="${BACKUP_AGE_IDENTITY_FILE:-}"
 CONTRACT_STATE_FILE="${CONTRACT_STATE_FILE:-}"
+APP_DB_ROLE="${APP_DB_ROLE:-}"
 
 TARGET_DATABASE_URL="${DATABASE_URL_ARG:-${DATABASE_URL:-}}"
 
@@ -406,6 +417,10 @@ AUDIT_REPORT_PATH="${AUDIT_REPORT_PATH:-${RESTORE_AUDIT_REPORT:-}}"
 # target URL is not fatal there.
 if [[ "$PLAN_ONLY" != "true" ]]; then
   [[ -n "$TARGET_DATABASE_URL" ]] || die 1 "target database URL is not set (use --database-url or DATABASE_URL)"
+fi
+if [[ "$VERIFY_GRANTS" == "true" ]]; then
+  [[ -n "$APP_DB_ROLE" ]] || die 1 "--verify-grants requires APP_DB_ROLE to name the application role"
+  [[ "$APP_DB_ROLE" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die 1 "invalid APP_DB_ROLE: $APP_DB_ROLE"
 fi
 
 # Record the sanitized target identity for the audit report (never the password).
@@ -975,6 +990,73 @@ apply_contract_state() {
   psql_exec "$url" -f "$sql_file" || die 4 "failed to apply post-restore SQL from $sql_file"
 }
 
+# Verify that the application role can reach every restored table. Dumps omit
+# ownership and privileges, so after a restore the role may not own or have
+# grants on the tables it needs. This check is read-only: it never grants
+# anything (and never elevates the role to superuser).
+verify_grants() {
+  local url="$1"
+  if [[ "$VERIFY_GRANTS" != "true" ]]; then
+    return 0
+  fi
+  log "verifying grants for application role '$APP_DB_ROLE'"
+
+  # Prefer the table list recorded at backup time; fall back to every
+  # non-system table currently in the database.
+  local tables=""
+  local expected_list="$EXTRACT_DIR/tables.txt"
+  if [[ -f "$expected_list" ]]; then
+    tables="$(grep -v '^[[:space:]]*$' "$expected_list" || true)"
+  fi
+  if [[ -z "$tables" ]]; then
+    log "no tables.txt in backup; checking all non-system tables"
+    tables="$(psql_exec "$url" -At -c \
+      "SELECT schemaname || '.' || tablename FROM pg_tables
+        WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+        ORDER BY 1;")"
+  fi
+
+  if [[ -z "$tables" ]]; then
+    log "WARNING: no tables found to check grants against"
+    return 0
+  fi
+
+  local role_exists
+  role_exists="$(psql_exec "$url" -At -c \
+    "SELECT 1 FROM pg_roles WHERE rolname = '$APP_DB_ROLE';")"
+  if [[ "$role_exists" != "1" ]]; then
+    die 5 "verification failed: application role '$APP_DB_ROLE' does not exist in the restored database"
+  fi
+
+  local mismatch=0 table schema name priv missing
+  while IFS= read -r table; do
+    [[ -n "$table" ]] || continue
+    schema="${table%%.*}"
+    name="${table#*.}"
+    missing=""
+    for priv in SELECT INSERT UPDATE DELETE; do
+      local allowed
+      allowed="$(psql_exec "$url" -At -c \
+        "SELECT has_table_privilege('$APP_DB_ROLE', '\"$schema\".\"$name\"', '$priv');")"
+      if [[ "$allowed" != "t" ]]; then
+        missing+="${missing:+, }$priv"
+      fi
+    done
+    if [[ -n "$missing" ]]; then
+      log "ERROR: role '$APP_DB_ROLE' lacks $missing on $table"
+      mismatch=1
+    else
+      log "grants OK for $table"
+    fi
+  done <<< "$tables"
+
+  if [[ "$mismatch" -ne 0 ]]; then
+    die 5 "verification failed: application role '$APP_DB_ROLE' is missing required table privileges (re-apply ownership/grants manually; this script does not grant them)"
+  fi
+
+  log "grant verification passed for role '$APP_DB_ROLE'"
+}
+
 # ---------------------------------------------------------------------------
 # Verification mode
 # ---------------------------------------------------------------------------
@@ -1041,6 +1123,8 @@ verify_restore() {
 
   verify_critical_tables "$verify_url"
 
+  verify_grants "$verify_url"
+
   log "verification passed"
 }
 
@@ -1071,6 +1155,7 @@ else
   confirm_restore
   restore_into "$TARGET_DATABASE_URL"
   apply_contract_state "$TARGET_DATABASE_URL"
+  verify_grants "$TARGET_DATABASE_URL"
   log "restore complete"
 fi
 

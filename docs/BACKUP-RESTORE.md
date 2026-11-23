@@ -510,7 +510,41 @@ If the target is unreachable or the role lacks a required permission, the script
    The script first runs the preflight checks described in section 7.1.1 (target connectivity, required permissions, and PostgreSQL version compatibility) and aborts early with a clear error if they fail — before downloading or decrypting anything, so no decrypted staging artifacts are created. Once preflight passes, it downloads the manifest and archive, validates the manifest schema version and required fields, verifies the archive SHA-256, decrypts, then verifies each component checksum from `components` against the decrypted files before replaying the dump in a single transaction (a failed restore changes nothing). Objects in the target that are not in the backup are left in place. If the manifest's `postgres` versions are incompatible with the target server, the script warns (or aborts with `--verify-only`) before applying anything. The work directory is cleaned up by a trap on every exit path unless `--keep-work-dir` is given.
    The script downloads the manifest and archive, validates the manifest schema version and required fields, verifies the archive SHA-256, decrypts, then validates the decrypted tarball before extraction: member count and total uncompressed size must stay within the configured budgets, and no two members may normalize to the same path (see section 2). Only after these checks pass does it extract, verify each component checksum from `components` against the decrypted files, and replay the dump in a single transaction (a failed restore changes nothing). Objects in the target that are not in the backup are left in place. If the manifest's `postgres` versions are incompatible with the target server, the script warns (or aborts with `--verify-only`) before applying anything.
 
+   **Ownership and privileges are not restored.** `pg_dump` (as used by `backup.sh`) does not include `GRANT`/`REVOKE` statements or object ownership, so a restored database has tables owned by the restoring role and no privileges for the application role. Re-apply the application role's grants after every restore (see 7.2.1).
+
    Before any destructive SQL is applied, `restore.sh` runs two pre-flight checks against the target (see sections 7.5 and 7.6): a PostgreSQL **extension inventory** comparison and a **lock/statement timeout** policy. Both produce actionable diagnostics and abort the restore before the transaction starts when they fail.
+
+#### 7.2.1 Post-restore ownership and grant checks
+
+`restore.sh` can verify that the expected application role can actually use the restored tables. Pass `--verify-grants` together with the application role name:
+
+```bash
+./scripts/restore.sh --backup soroban-backup-<timestamp> \
+  --database-url "$DATABASE_URL" \
+  --verify-grants --app-db-role "$APP_DB_ROLE"
+```
+
+- `--verify-grants` enables the check; it is off by default so existing restores are unaffected.
+- `APP_DB_ROLE` (or `--app-db-role`) names the application role, e.g. `synapsvault_app`. The check is skipped with a warning if the flag is set but no role is provided.
+- For every table listed in the backup's `tables.txt`, the script checks that the role has the privileges the application needs (`SELECT`, `INSERT`, `UPDATE`, `DELETE`). Missing privileges are reported per table and the script exits non-zero (exit code 5, verification) so the restore is not considered successful.
+- The check only reads `information_schema`/`has_table_privilege`; it never grants anything and never requires superuser.
+
+Expected least-privilege setup for the application role (no superuser, no `CREATEDB`/`CREATEROLE`):
+
+```sql
+-- Run once per restored database, as the owner of the restored tables.
+GRANT CONNECT ON DATABASE <db> TO synapsvault_app;
+GRANT USAGE ON SCHEMA public TO synapsvault_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO synapsvault_app;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO synapsvault_app;
+-- Keep future tables covered as well.
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO synapsvault_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT USAGE, SELECT ON SEQUENCES TO synapsvault_app;
+```
+
+Grant only what the application needs: table-level `SELECT`/`INSERT`/`UPDATE`/`DELETE` (plus sequence usage) is sufficient for normal operation. Do **not** grant `SUPERUSER`, `CREATEDB`, `CREATEROLE`, or ownership of the restored objects to the application role; migrations should run under a separate owner/migration role.
 
 5. **Inspect contract state snapshots (if needed).** Add `--keep-work-dir` to keep the extracted `contracts/` snapshots. On-chain state cannot be "restored"; use the snapshots to confirm which contract IDs the application should point at, and use `scripts/rollback-contracts.cjs` to repoint it.
 
@@ -529,6 +563,7 @@ After restore, verify the following:
 
 - [ ] `restore.sh` finished with `restore complete` (exit code 0).
 - [ ] Row counts for critical tables look plausible (`--verify-only` logs counts for every table).
+- [ ] The application role can access required tables: `--verify-grants --app-db-role "$APP_DB_ROLE"` reports no missing privileges (see 7.2.1), and the role has no superuser rights.
 - [ ] Critical-table counts are within the expected counts/bounds recorded in the backup (see section 7.7); the restore fails verification otherwise.
 - [ ] The sanitized audit report (section 7.8) was produced and, in CI, uploaded as an artifact.
 - [ ] The application's `/health` endpoint reports healthy.
