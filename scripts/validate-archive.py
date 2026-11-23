@@ -2,6 +2,7 @@
 """Reject archive members that could escape the restore directory and
 validate backup manifests before a restore is attempted."""
 import json
+import os
 import re
 import sys
 import tarfile
@@ -10,6 +11,14 @@ from pathlib import PurePosixPath
 # Manifest schema versions this validator understands. Restores must reject
 # anything outside this set before touching the database.
 SUPPORTED_SCHEMA_VERSIONS = (1,)
+
+# Default budgets for archive expansion. These bound the work a restore can
+# trigger before any member is extracted.
+DEFAULT_MAX_MEMBERS = 10000
+DEFAULT_MAX_UNCOMPRESSED_BYTES = 10 * 1024 * 1024 * 1024  # 10 GiB
+
+ENV_MAX_MEMBERS = 'RESTORE_MAX_MEMBERS'
+ENV_MAX_UNCOMPRESSED_BYTES = 'RESTORE_MAX_UNCOMPRESSED_BYTES'
 
 SHA256_HEX = re.compile(r'^[0-9a-f]{64}$')
 
@@ -25,15 +34,171 @@ REQUIRED_STRING_FIELDS = (
 
 REQUIRED_COMPONENTS = ('database', 'contracts')
 
+# Top-level entries a restore bundle may contain. Anything else is rejected so
+# unexplained executables or unrelated files cannot ride along with a restore.
+ALLOWED_TOP_LEVEL = frozenset({
+    'database.sql.gz',
+    'tables.txt',
+    'contracts',
+    'manifest.json',
+})
 
-def validate(archive):
+# Optional metadata files that may appear at the top level but are not required.
+OPTIONAL_METADATA = frozenset({
+    'README',
+    'README.md',
+    'metadata.json',
+})
+
+# Top-level components that must be present for a bundle to be restorable.
+REQUIRED_TOP_LEVEL = frozenset({
+    'database.sql.gz',
+    'contracts',
+    'manifest.json',
+})
+
+
+def _top_level(name):
+    """Return the first path component of an archive member name."""
+    parts = PurePosixPath(name).parts
+    return parts[0] if parts else ''
+
+
+def validate_components(names):
+    """Validate the set of archive member names against the component allowlist.
+
+    Rejects unknown top-level entries and fails closed when a required
+    top-level component is missing.
+    """
+    present = set()
+    for name in names:
+        top = _top_level(name)
+        if not top:
+            raise ValueError(f'unsupported archive member: {name}')
+        if top not in ALLOWED_TOP_LEVEL and top not in OPTIONAL_METADATA:
+            raise ValueError(f'unexpected top-level archive entry: {top}')
+        present.add(top)
+
+    missing = sorted(REQUIRED_TOP_LEVEL - present)
+    if missing:
+        raise ValueError(
+            'archive missing required top-level component(s): ' + ', '.join(missing)
+        )
+    return present
+
+# Archive members a restore plan reports on. These are informational: plan mode
+# lists which are present without requiring any particular one.
+KNOWN_ARCHIVE_COMPONENTS = ('database.sql.gz', 'tables.txt', 'contracts/')
+
+# Optional, backward-compatible status fields. Older manifests omit them; when
+# present they must be non-empty strings so plan mode can report them.
+OPTIONAL_STATUS_FIELDS = ('upload_status', 'retention_status')
+
+
+def _member_path(member):
+    return PurePosixPath(member.name)
+
+
+def _check_member(member):
+    path = _member_path(member)
+    if path.is_absolute() or '..' in path.parts:
+        raise ValueError(f'unsafe archive path: {member.name}')
+    if not (member.isfile() or member.isdir()):
+        raise ValueError(f'unsupported archive member: {member.name}')
+
+
+def normalize_member_name(name):
+    """Return a canonical member path for duplicate detection.
+
+    Strips leading './', collapses redundant slashes and resolves '.' segments
+    so that equivalent spellings map to the same normalized name.
+    """
+    parts = []
+    for part in name.split('/'):
+        if part in ('', '.'):
+            continue
+        parts.append(part)
+    return '/'.join(parts)
+
+
+def _resolve_budget(explicit, env_name, default, label):
+    if explicit is not None:
+        value = explicit
+    elif os.environ.get(env_name):
+        raw = os.environ[env_name]
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f'{env_name} must be an integer, got: {raw!r}')
+    else:
+        value = default
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f'{label} must be a non-negative integer')
+    return value
+
+
+def validate(archive, max_members=None, max_uncompressed_bytes=None):
+    max_members = _resolve_budget(
+        max_members, ENV_MAX_MEMBERS, DEFAULT_MAX_MEMBERS, 'max_members'
+    )
+    max_uncompressed_bytes = _resolve_budget(
+        max_uncompressed_bytes,
+        ENV_MAX_UNCOMPRESSED_BYTES,
+        DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        'max_uncompressed_bytes',
+    )
+
+    seen = set()
+    member_count = 0
+    total_size = 0
     with tarfile.open(archive, 'r:gz') as bundle:
+        names = []
         for member in bundle:
             path = PurePosixPath(member.name)
             if path.is_absolute() or '..' in path.parts:
                 raise ValueError(f'unsafe archive path: {member.name}')
             if not (member.isfile() or member.isdir()):
                 raise ValueError(f'unsupported archive member: {member.name}')
+            if member.mode & 0o111:
+                raise ValueError(f'executable archive member: {member.name}')
+            names.append(member.name)
+        validate_components(names)
+            _check_member(member)
+
+
+def inspect_archive(archive):
+    """Validate archive safety and report its known components.
+
+    Returns a dict mapping each known component name to a boolean indicating
+    whether it is present. No database writes or extraction occur.
+    """
+    present = {name: False for name in KNOWN_ARCHIVE_COMPONENTS}
+    with tarfile.open(archive, 'r:gz') as bundle:
+        for member in bundle:
+            _check_member(member)
+            name = member.name
+            if name in present:
+                present[name] = True
+            elif name.startswith('contracts/'):
+                present['contracts/'] = True
+    return present
+
+            normalized = normalize_member_name(member.name)
+            if normalized in seen:
+                raise ValueError(f'duplicate archive member: {member.name}')
+            seen.add(normalized)
+
+            member_count += 1
+            if member_count > max_members:
+                raise ValueError(
+                    f'archive exceeds member budget of {max_members}'
+                )
+            total_size += member.size
+            if total_size > max_uncompressed_bytes:
+                raise ValueError(
+                    'archive exceeds uncompressed size budget of '
+                    f'{max_uncompressed_bytes} bytes'
+                )
 
 
 def _require(manifest, field):
@@ -72,6 +237,10 @@ def validate_manifest(manifest):
 
     for field in REQUIRED_STRING_FIELDS:
         _require_string(manifest, field)
+
+    for field in OPTIONAL_STATUS_FIELDS:
+        if field in manifest:
+            _require_string(manifest, field)
 
     size = _require(manifest, 'sizeBytes')
     if isinstance(size, bool) or not isinstance(size, int) or size < 0:
@@ -112,12 +281,66 @@ def validate_manifest_file(path):
     return validate_manifest(manifest)
 
 
+def _parse_args(argv):
+    """Parse positional archive/manifest plus optional budget flags."""
+    max_members = None
+    max_uncompressed_bytes = None
+    positional = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == '--max-members':
+            index += 1
+            if index >= len(argv):
+                raise ValueError('--max-members requires a value')
+            max_members = argv[index]
+        elif arg.startswith('--max-members='):
+            max_members = arg.split('=', 1)[1]
+        elif arg == '--max-uncompressed-bytes':
+            index += 1
+            if index >= len(argv):
+                raise ValueError('--max-uncompressed-bytes requires a value')
+            max_uncompressed_bytes = argv[index]
+        elif arg.startswith('--max-uncompressed-bytes='):
+            max_uncompressed_bytes = arg.split('=', 1)[1]
+        else:
+            positional.append(arg)
+        index += 1
+
+    if not positional:
+        raise ValueError(
+            'usage: validate-archive.py [--max-members N] '
+            '[--max-uncompressed-bytes N] <archive> [manifest]'
+        )
+    if len(positional) > 2:
+        raise ValueError(
+            'usage: validate-archive.py [--max-members N] '
+            '[--max-uncompressed-bytes N] <archive> [manifest]'
+        )
+
+    def _to_int(value, label):
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            raise ValueError(f'{label} must be an integer, got: {value!r}')
+
+    return (
+        positional[0],
+        positional[1] if len(positional) > 1 else None,
+        _to_int(max_members, '--max-members'),
+        _to_int(max_uncompressed_bytes, '--max-uncompressed-bytes'),
+    )
+
+
 if __name__ == '__main__':
     try:
-        if len(sys.argv) < 2:
-            raise ValueError('usage: validate-archive.py <archive> [manifest]')
-        validate(sys.argv[1])
-        if len(sys.argv) > 2:
-            validate_manifest_file(sys.argv[2])
+        archive, manifest, max_members, max_uncompressed_bytes = _parse_args(
+            sys.argv[1:]
+        )
+        validate(archive, max_members, max_uncompressed_bytes)
+        if manifest is not None:
+            validate_manifest_file(manifest)
     except (OSError, ValueError, tarfile.TarError) as error:
         sys.exit(str(error))

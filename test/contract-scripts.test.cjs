@@ -381,6 +381,216 @@ test('deployment resume rejects contract IDs from another network', () => {
   }
 });
 
+test('deploy parseArgs understands --manifest, --plan, --record and --lock', () => {
+  const args = deploy.parseArgs([
+    '--network=testnet',
+    '--manifest',
+    'build.json',
+    '--plan',
+    '--record',
+    'rec.json',
+    '--lock',
+    'lockfile',
+  ]);
+  assert.equal(args.network, 'testnet');
+  assert.equal(args.manifest, 'build.json');
+  assert.equal(args.plan, true);
+  assert.equal(args.record, 'rec.json');
+  assert.equal(args.lock, 'lockfile');
+});
+
+test('deploy loadManifest and validateArtifactChecksums accept matching checksums', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'manifest-test-'));
+  try {
+    const wasmPath = path.join(dir, 'vault_registry.wasm');
+    fs.writeFileSync(wasmPath, Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01]));
+    const hash = deploy.hashWasmFile(wasmPath);
+
+    const manifestPath = path.join(dir, 'manifest.json');
+    fs.writeFileSync(
+      manifestPath,
+      JSON.stringify({ artifacts: { 'vault_registry.wasm': hash } })
+    );
+
+    const manifest = deploy.loadManifest(manifestPath);
+    assert.equal(manifest['vault_registry.wasm'], hash);
+
+    const contracts = [{ name: 'vault-registry', wasm: wasmPath }];
+    const result = deploy.validateArtifactChecksums(contracts, manifest);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].artifactHash, hash);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('deploy validateArtifactChecksums fails on a modified artifact before signing', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'manifest-test-'));
+  try {
+    const wasmPath = path.join(dir, 'vault_registry.wasm');
+    fs.writeFileSync(wasmPath, Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01]));
+    const manifest = { 'vault_registry.wasm': 'deadbeef'.repeat(8) };
+
+    assert.throws(
+      () => deploy.validateArtifactChecksums([{ name: 'vault-registry', wasm: wasmPath }], manifest),
+      /checksum mismatch/i
+    );
+
+    // A missing manifest entry is also a failure.
+    assert.throws(
+      () => deploy.validateArtifactChecksums([{ name: 'vault-registry', wasm: wasmPath }], {}),
+      /missing.*manifest|manifest.*missing/i
+    );
+
+    // Preflight must reject a tampered artifact before any signing happens.
+    const kp = Keypair.random();
+    let signed = false;
+    const mockServer = {
+      getAccountEntry: async () => ({ balance: () => '250000000' }),
+      prepareTransaction: async () => ({
+        sign: () => {
+          signed = true;
+        },
+      }),
+      sendTransaction: async () => {
+        throw new Error('should not submit');
+      },
+    };
+    await assert.rejects(
+      () =>
+        deploy.preflightChecks({
+          server: mockServer,
+          keypair: kp,
+          network: 'testnet',
+          contracts: [{ name: 'vault-registry', wasm: wasmPath }],
+          manifest,
+          dryRun: false,
+        }),
+      /checksum mismatch/i
+    );
+    assert.equal(signed, false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('deploy buildDeploymentRecord records artifact and on-chain hashes', () => {
+  const record = deploy.buildDeploymentRecord({
+    network: 'testnet',
+    signer: Keypair.random().publicKey(),
+    contracts: [
+      {
+        name: 'vault-registry',
+        contractId: VALID_ID,
+        artifactHash: 'a'.repeat(64),
+        onChainHash: 'a'.repeat(64),
+      },
+    ],
+  });
+  assert.equal(record.network, 'testnet');
+  assert.equal(record.contracts[0].artifactHash, 'a'.repeat(64));
+  assert.equal(record.contracts[0].onChainHash, 'a'.repeat(64));
+  assert.equal(record.contracts[0].contractId, VALID_ID);
+});
+
+test('deploy verifyDeploymentRecord reports mismatches clearly', async () => {
+  const record = {
+    network: 'testnet',
+    contracts: [
+      { name: 'vault-registry', contractId: VALID_ID, artifactHash: 'a'.repeat(64), onChainHash: 'a'.repeat(64) },
+    ],
+  };
+
+  const matchingServer = {
+    getContractWasmByContractId: async () => Buffer.from('a'.repeat(64)),
+    getContractData: async () => ({ val: { value: { value: { value: { storage: [] } } } } }),
+  };
+  const ok = await deploy.verifyDeploymentRecord({ server: matchingServer, record });
+  assert.equal(ok.mismatches.length, 0);
+
+  const mismatchedServer = {
+    getContractWasmByContractId: async () => Buffer.from('b'.repeat(64)),
+    getContractData: async () => ({ val: { value: { value: { value: { storage: [] } } } } }),
+  };
+  const bad = await deploy.verifyDeploymentRecord({ server: mismatchedServer, record });
+  assert.equal(bad.mismatches.length, 1);
+  assert.match(bad.mismatches[0].reason, /on-chain hash mismatch/i);
+});
+
+test('deploy acquireLock prevents a concurrent deployment and handles stale locks', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lock-test-'));
+  const lockPath = path.join(dir, 'deploy.lock');
+  const signer = Keypair.random().publicKey();
+  try {
+    const release = deploy.acquireLock({ lockPath, signer, network: 'testnet' });
+    assert.throws(
+      () => deploy.acquireLock({ lockPath, signer, network: 'testnet' }),
+      /already in progress|locked/i
+    );
+    release();
+    // After release a new lock can be acquired.
+    const release2 = deploy.acquireLock({ lockPath, signer, network: 'testnet' });
+    release2();
+
+    // A stale lock (old mtime) is reclaimed.
+    fs.writeFileSync(lockPath, JSON.stringify({ signer, network: 'testnet', pid: 999999 }));
+    const old = Date.now() / 1000 - 60 * 60 * 24;
+    fs.utimesSync(lockPath, old, old);
+    const release3 = deploy.acquireLock({ lockPath, signer, network: 'testnet', staleMs: 1000 });
+    release3();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('deploy plan mode reports details without signing or submitting and masks secrets', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'plan-test-'));
+  const kp = Keypair.random();
+  try {
+    const contracts = deploy.CONTRACTS.map((c) => {
+      const wasmPath = path.join(dir, c.wasmFile);
+      fs.writeFileSync(wasmPath, Buffer.from([0x00, 0x61, 0x73, 0x6d]));
+      return { ...c, wasm: wasmPath };
+    });
+
+    let signed = false;
+    let submitted = false;
+    const mockServer = {
+      getAccountEntry: async () => ({ balance: () => '250000000' }),
+      prepareTransaction: async () => ({
+        sign: () => {
+          signed = true;
+        },
+      }),
+      sendTransaction: async () => {
+        submitted = true;
+        return { status: 'PENDING', hash: 'x' };
+      },
+    };
+
+    const plan = await deploy.runPlan({
+      server: mockServer,
+      keypair: kp,
+      network: 'testnet',
+      contracts,
+      adminAddress: kp.publicKey(),
+    });
+
+    assert.equal(plan.network, 'testnet');
+    assert.equal(plan.signer, kp.publicKey());
+    assert.equal(plan.contracts.length, contracts.length);
+    assert.ok(plan.contracts.every((c) => typeof c.artifactHash === 'string'));
+    assert.ok(plan.operations.length > 0);
+    assert.equal(signed, false);
+    assert.equal(submitted, false);
+
+    const serialized = JSON.stringify(plan);
+    assert.ok(!serialized.includes(kp.secret()), 'plan must not leak the secret key');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('contract verification rejects an unexpected on-chain admin', async () => {
   const { nativeToScVal } = require('@stellar/stellar-sdk');
   const server = {

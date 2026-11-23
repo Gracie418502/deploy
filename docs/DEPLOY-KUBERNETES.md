@@ -223,6 +223,19 @@ kubectl describe pod <pod> -n synapsvault
 kubectl logs <pod> -n synapsvault
 ```
 
+### Verifying the API docs endpoint
+
+The smoke test (`scripts/06-smoke-test.js`) does not accept any `200` response for the API docs path. It fetches the documented OpenAPI/Swagger endpoint and validates the response body: the content must be JSON with an OpenAPI/Swagger signature (e.g. an `openapi` or `swagger` version field and a `paths` object). A response that is `200` but returns HTML — for example an ingress SPA fallback serving `index.html` for the docs path — fails the check.
+
+If the smoke test reports the docs endpoint returned HTML or non-OpenAPI content, confirm the ingress routes the docs path to the backend rather than the frontend:
+
+```sh
+kubectl get ingress -n synapsvault
+curl -fsS -H 'Accept: application/json' https://<host>/api/docs-json | head -n 5
+```
+
+The response should be JSON, not `<!DOCTYPE html>`.
+
 ## 4. Scale
 
 Scale a deployment manually:
