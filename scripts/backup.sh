@@ -36,6 +36,27 @@ umask 077
 BACKUP_TIMESTAMP="${BACKUP_TIMESTAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 BACKUP_DATE_ISO="${BACKUP_DATE_ISO:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
+# Unique run identifier. Every staging/archive/manifest/metrics artifact name
+# includes this ID so that two concurrent invocations (even with the same
+# BACKUP_TIMESTAMP) can never overwrite each other's files. Collision behavior:
+#   - The run ID is derived from the PID plus a random suffix, so collisions are
+#     practically impossible; if a collision were ever detected the run aborts
+#     with a configuration error rather than reusing an existing artifact.
+#   - An execution lock (see acquire_lock) additionally serializes runs that
+#     share a lock file, so overlapping runs fail fast instead of racing.
+BACKUP_RUN_ID="${BACKUP_RUN_ID:-$(printf '%s-%s' "$$" "$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || date -u +%N)")}"
+# Execution lock file. Defaults to a file inside the work directory; set
+# BACKUP_LOCK_FILE to a shared path to serialize runs across processes.
+BACKUP_LOCK_FILE="${BACKUP_LOCK_FILE:-${WORK_DIR}/.backup.lock}"
+# Set to 1 to skip acquiring the execution lock (not recommended).
+BACKUP_SKIP_LOCK="${BACKUP_SKIP_LOCK:-0}"
+# Required free bytes on the staging filesystem before a dump is created.
+# Defaults to 1 GiB; override with BACKUP_REQUIRED_FREE_BYTES.
+BACKUP_REQUIRED_FREE_BYTES="${BACKUP_REQUIRED_FREE_BYTES:-1073741824}"
+# Set to 1 to skip the preflight free-space check.
+BACKUP_SKIP_FREE_SPACE_CHECK="${BACKUP_SKIP_FREE_SPACE_CHECK:-0}"
+=======
+
 # Working directory for staging artifacts.
 WORK_DIR="${BACKUP_WORK_DIR:-$(mktemp -d -t soroban-backup-XXXXXXXX)}"
 # Caller-owned directories may contain unrelated files; preserve them by default.
@@ -46,10 +67,13 @@ else
 fi
 
 # Artifact naming.
+# BACKUP_NAME is validated (see validate_artifact_name) before being used to
+# build any local or remote path. The run ID is appended so concurrent runs
+# never share archive/manifest names.
 BACKUP_NAME="${BACKUP_NAME:-soroban-backup-${BACKUP_TIMESTAMP}}"
-ARCHIVE_PATH="${WORK_DIR}/${BACKUP_NAME}.tar.gz"
-ENCRYPTED_PATH="${ARCHIVE_PATH}.enc"
-MANIFEST_PATH="${WORK_DIR}/${BACKUP_NAME}.manifest.json"
+ARCHIVE_PATH=""
+ENCRYPTED_PATH=""
+MANIFEST_PATH=""
 
 # Prometheus textfile collector output and optional Pushgateway endpoint.
 PROM_DIR="${PROM_DIR:-/var/lib/node_exporter/textfile_collector}"
@@ -116,6 +140,11 @@ BACKUP_OUTPUT_DIR="${BACKUP_OUTPUT_DIR:-}"
 
 # Set by main(); read by the EXIT trap to report failure metrics.
 START_TS=""
+# Set to a short reason string when a run fails for a specific, reportable
+# reason (e.g. "insufficient_space"); surfaced in the failure metric.
+FAILURE_REASON=""
+# File descriptor held open for the execution lock.
+LOCK_FD=""
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -151,9 +180,18 @@ cleanup() {
   if [[ "${exit_code}" -ne 0 && -n "${START_TS}" ]]; then
     local end_ts
     end_ts="$(date -u +%s)"
+    local reason_msg="backup failed with exit code ${exit_code}"
+    if [[ -n "${FAILURE_REASON}" ]]; then
+      reason_msg="${reason_msg} (reason=${FAILURE_REASON})"
+    fi
     emit_metrics 0 "$(( end_ts - START_TS ))" 0 "$(previous_last_success)" \
-      "backup failed with exit code ${exit_code}" || true
+      "${reason_msg}" || true
     error "Backup failed with exit code ${exit_code}"
+  fi
+  if [[ -n "${LOCK_FD}" ]]; then
+    flock -u "${LOCK_FD}" 2>/dev/null || true
+    eval "exec ${LOCK_FD}>&-" 2>/dev/null || true
+    LOCK_FD=""
   fi
   if [[ "${CLEANUP_WORK_DIR}" == "1" && -d "${WORK_DIR}" ]]; then
     debug "Cleaning up work directory ${WORK_DIR}"
@@ -164,6 +202,128 @@ cleanup() {
   exit "${exit_code}"
 }
 trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+# Reject artifact names / storage prefixes that could escape the intended
+# directory or object namespace. Rejects:
+#   - empty values
+#   - any '/' (path separators)
+#   - '..' or '.' path segments
+#   - control characters (including newlines, tabs, NUL)
+#   - leading '-' (would be parsed as an option)
+# Usage: validate_artifact_name <label> <value> [allow_slash]
+validate_artifact_name() {
+  local label="$1"
+  local value="$2"
+  local allow_slash="${3:-0}"
+
+  if [[ -z "${value}" ]]; then
+    die 2 "${label} must not be empty"
+  fi
+
+  # Control characters (0x00-0x1F, 0x7F).
+  if printf '%s' "${value}" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    die 2 "${label} contains control characters: $(printf '%q' "${value}")"
+  fi
+
+  if [[ "${value}" == -* ]]; then
+    die 2 "${label} must not start with '-': $(printf '%q' "${value}")"
+  fi
+
+  if [[ "${allow_slash}" != "1" && "${value}" == */* ]]; then
+    die 2 "${label} must not contain '/': $(printf '%q' "${value}")"
+  fi
+
+  # Reject '.' and '..' segments (also catches '..' anywhere when slashes are
+  # disallowed, since the whole value is a single segment).
+  local segment
+  local IFS='/'
+  for segment in ${value}; do
+    if [[ "${segment}" == "." || "${segment}" == ".." ]]; then
+      die 2 "${label} contains a traversal segment: $(printf '%q' "${value}")"
+    fi
+  done
+  unset IFS
+
+  if [[ "${value}" == *..* && "${allow_slash}" != "1" ]]; then
+    die 2 "${label} contains a traversal segment: $(printf '%q' "${value}")"
+  fi
+}
+
+# Validate all user-controlled names and derive artifact paths.
+validate_configuration() {
+  validate_artifact_name "BACKUP_NAME" "${BACKUP_NAME}"
+  validate_artifact_name "BACKUP_STORAGE_PREFIX" "${BACKUP_STORAGE_PREFIX}" 1
+  validate_artifact_name "BACKUP_RUN_ID" "${BACKUP_RUN_ID}"
+
+  ARCHIVE_PATH="${WORK_DIR}/${BACKUP_NAME}-${BACKUP_RUN_ID}.tar.gz"
+  ENCRYPTED_PATH="${ARCHIVE_PATH}.enc"
+  MANIFEST_PATH="${WORK_DIR}/${BACKUP_NAME}-${BACKUP_RUN_ID}.manifest.json"
+}
+
+# ---------------------------------------------------------------------------
+# Execution lock
+# ---------------------------------------------------------------------------
+
+# Acquire an exclusive, non-blocking lock so overlapping runs fail fast rather
+# than racing on shared artifact names. Uses flock(1) when available; if flock
+# is unavailable the unique run ID still prevents artifact collisions.
+acquire_lock() {
+  if [[ "${BACKUP_SKIP_LOCK}" == "1" ]]; then
+    warn "Execution lock disabled (BACKUP_SKIP_LOCK=1); relying on unique run ID only"
+    return 0
+  fi
+
+  if ! command -v flock >/dev/null 2>&1; then
+    warn "flock not available; relying on unique run ID to avoid artifact collisions"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "${BACKUP_LOCK_FILE}")"
+  exec {LOCK_FD}>"${BACKUP_LOCK_FILE}"
+  if ! flock -n "${LOCK_FD}"; then
+    eval "exec ${LOCK_FD}>&-" 2>/dev/null || true
+    LOCK_FD=""
+    FAILURE_REASON="lock_contention"
+    die 1 "Another backup run holds the lock ${BACKUP_LOCK_FILE}; aborting to avoid overlap"
+  fi
+  debug "Acquired execution lock ${BACKUP_LOCK_FILE}"
+}
+
+# ---------------------------------------------------------------------------
+# Preflight free-space check
+# ---------------------------------------------------------------------------
+
+# Fail early if the staging filesystem lacks BACKUP_REQUIRED_FREE_BYTES.
+check_free_space() {
+  if [[ "${BACKUP_SKIP_FREE_SPACE_CHECK}" == "1" ]]; then
+    warn "Preflight free-space check disabled (BACKUP_SKIP_FREE_SPACE_CHECK=1)"
+    return 0
+  fi
+
+  if ! [[ "${BACKUP_REQUIRED_FREE_BYTES}" =~ ^[0-9]+$ ]]; then
+    die 2 "BACKUP_REQUIRED_FREE_BYTES must be a non-negative integer: ${BACKUP_REQUIRED_FREE_BYTES}"
+  fi
+
+  mkdir -p "${WORK_DIR}"
+  local available
+  available="$(df -Pk "${WORK_DIR}" 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [[ -z "${available}" ]]; then
+    warn "Could not determine free space for ${WORK_DIR}; skipping preflight check"
+    return 0
+  fi
+  # df -Pk reports 1024-byte blocks.
+  local available_bytes=$(( available * 1024 ))
+
+  if [[ "${available_bytes}" -lt "${BACKUP_REQUIRED_FREE_BYTES}" ]]; then
+    FAILURE_REASON="insufficient_space"
+    die 1 "Insufficient free space in ${WORK_DIR}: ${available_bytes} bytes available, ${BACKUP_REQUIRED_FREE_BYTES} required (set BACKUP_REQUIRED_FREE_BYTES to adjust)"
+  fi
+  debug "Free space check passed: ${available_bytes} bytes available, ${BACKUP_REQUIRED_FREE_BYTES} required"
+}
 
 # ---------------------------------------------------------------------------
 # Dependency checks
@@ -246,7 +406,7 @@ emit_metrics() {
   local last_success_ts="$4" # unix epoch of last success (0 if unknown)
   local error_message="${5:-}"
 
-  local payload_file="${WORK_DIR}/soroban_backup.prom"
+  local payload_file="${WORK_DIR}/soroban_backup-${BACKUP_RUN_ID}.prom"
   mkdir -p "${WORK_DIR}"
 
   {
@@ -276,6 +436,14 @@ emit_metrics() {
       local escaped
       escaped="$(printf '%s' "${error_message}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\n/ /g')"
       printf 'soroban_backup_last_error_info{message="%s"} 1\n' "${escaped}"
+    fi
+
+    if [[ -n "${FAILURE_REASON}" ]]; then
+      printf '# HELP soroban_backup_failure_reason Whether the last run failed for a specific reason (1=yes).\n'
+      printf '# TYPE soroban_backup_failure_reason gauge\n'
+      local reason_escaped
+      reason_escaped="$(printf '%s' "${FAILURE_REASON}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\n/ /g')"
+      printf 'soroban_backup_failure_reason{reason="%s"} 1\n' "${reason_escaped}"
     fi
   } > "${payload_file}"
 
@@ -824,10 +992,11 @@ write_manifest() {
     "database": "$(json_escape "${db_checksum}")",
     "contracts": "$(json_escape "${contracts_checksum}")"
   },
+  "runId": "$(json_escape "${BACKUP_RUN_ID}")",
   "artifacts": {
-    "archive": "$(json_escape "${BACKUP_NAME}.tar.gz")",
+    "archive": "$(json_escape "$(basename "${ARCHIVE_PATH}")")",
     "encrypted": "$(json_escape "${enc_basename}")",
-    "manifest": "$(json_escape "${BACKUP_NAME}.manifest.json")"
+    "manifest": "$(json_escape "$(basename "${MANIFEST_PATH}")")"
   }
 }
 EOF
@@ -844,13 +1013,18 @@ main() {
   start_ts="$(date -u +%s)"
   START_TS="${start_ts}"
 
-  info "Starting backup ${BACKUP_NAME}"
+  info "Starting backup ${BACKUP_NAME} (run ${BACKUP_RUN_ID})"
 
+  validate_configuration
   check_dependencies
+  acquire_lock
 
   mkdir -p "${WORK_DIR}"
-  local staging_dir="${WORK_DIR}/staging"
+  local staging_dir="${WORK_DIR}/staging-${BACKUP_RUN_ID}"
   mkdir -p "${staging_dir}"
+
+  # Preflight: fail before creating any dump if staging space is insufficient.
+  check_free_space
 
   # 1. Database dump.
   dump_database "${staging_dir}"
@@ -909,6 +1083,8 @@ main() {
   emit_metrics 1 "${duration}" "${size_bytes}" "${end_ts}" ""
 
   # 8. Optional local copy of the manifest (e.g. for CI artifact upload).
+  # The run-scoped copy is always written; the shared `manifest.json` pointer
+  # is only updated on success and is last-writer-wins by design.
   if [[ -n "${BACKUP_OUTPUT_DIR}" ]]; then
     mkdir -p "${BACKUP_OUTPUT_DIR}"
     cp -f "${MANIFEST_PATH}" "${BACKUP_OUTPUT_DIR}/"
@@ -954,7 +1130,7 @@ prune_old_backups() {
     local obj_name
     while IFS= read -r obj_name; do
       [[ -n "${obj_name}" ]] || continue
-      if [[ "${obj_name}" =~ ^soroban-backup-([0-9]{8}T[0-9]{6}Z)\.(tar\.gz\.enc|manifest\.json)$ ]]; then
+      if [[ "${obj_name}" =~ ^soroban-backup-([0-9]{8}T[0-9]{6}Z)(-[0-9A-Za-z]+)?\.(tar\.gz\.enc|manifest\.json)$ ]]; then
         local obj_ts="${BASH_REMATCH[1]}"
         if [[ "${obj_ts}" < "${cutoff_ts}" ]]; then
           info "Deleting expired backup object s3://${BACKUP_STORAGE_BUCKET}/${prefix}/${obj_name}"

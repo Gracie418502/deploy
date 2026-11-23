@@ -34,6 +34,115 @@ for name, kind, valid in [('./database.sql.gz', tarfile.REGTYPE, True), ('../esc
   assert.equal(result.status, 0, result.error?.message || result.stderr);
 });
 
+test('archive validation enforces member-count and size budgets', () => {
+  const result = spawnSync(
+    'python3',
+    [
+      '-c',
+      `
+import importlib.util, io, tarfile, tempfile
+spec = importlib.util.spec_from_file_location('validator', 'scripts/validate-archive.py')
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+def build(members):
+    archive = tempfile.NamedTemporaryFile(suffix='.tar.gz')
+    with tarfile.open(fileobj=archive, mode='w:gz') as bundle:
+        for name, size in members:
+            member = tarfile.TarInfo(name)
+            member.type = tarfile.REGTYPE
+            member.size = size
+            bundle.addfile(member, io.BytesIO(b'\\0' * size))
+    archive.flush()
+    return archive
+
+def expect_reject(archive, **kwargs):
+    try:
+        module.validate(archive.name, **kwargs)
+    except ValueError:
+        return
+    raise AssertionError('oversized archive was accepted: %r' % (kwargs,))
+
+def expect_accept(archive, **kwargs):
+    module.validate(archive.name, **kwargs)
+
+# Within budget.
+with build([('database.sql.gz', 10), ('contracts.tar.gz', 10)]) as archive:
+    expect_accept(archive, max_members=2, max_bytes=20)
+
+# Too many members.
+with build([('a', 1), ('b', 1), ('c', 1)]) as archive:
+    expect_reject(archive, max_members=2, max_bytes=1000)
+
+# Too many uncompressed bytes.
+with build([('a', 100), ('b', 100)]) as archive:
+    expect_reject(archive, max_members=10, max_bytes=150)
+
+# Exactly at the byte budget is allowed.
+with build([('a', 100), ('b', 100)]) as archive:
+    expect_accept(archive, max_members=10, max_bytes=200)
+`,
+    ],
+    { cwd: path.resolve(__dirname, '..'), encoding: 'utf8' }
+  );
+  assert.equal(result.status, 0, result.error?.message || result.stderr);
+});
+
+test('archive validation rejects duplicate and equivalent member paths', () => {
+  const result = spawnSync(
+    'python3',
+    [
+      '-c',
+      `
+import importlib.util, io, tarfile, tempfile
+spec = importlib.util.spec_from_file_location('validator', 'scripts/validate-archive.py')
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+def build(names):
+    archive = tempfile.NamedTemporaryFile(suffix='.tar.gz')
+    with tarfile.open(fileobj=archive, mode='w:gz') as bundle:
+        for name in names:
+            member = tarfile.TarInfo(name)
+            member.type = tarfile.REGTYPE
+            bundle.addfile(member, io.BytesIO(b''))
+    archive.flush()
+    return archive
+
+def expect_reject(names):
+    with build(names) as archive:
+        try:
+            module.validate(archive.name)
+        except ValueError:
+            return
+        raise AssertionError('duplicate members were accepted: %r' % (names,))
+
+def expect_accept(names):
+    with build(names) as archive:
+        module.validate(archive.name)
+
+# Exact duplicates.
+expect_reject(['a', 'a'])
+expect_reject(['database.sql.gz', 'contracts.tar.gz', 'database.sql.gz'])
+
+# Equivalent path spellings.
+expect_reject(['./a', 'a'])
+expect_reject(['a', './a'])
+expect_reject(['a//b', 'a/b'])
+expect_reject(['a/b', 'a//b'])
+expect_reject(['a/./b', 'a/b'])
+expect_reject(['./a//b', 'a/b'])
+
+# Distinct paths remain valid.
+expect_accept(['a', 'b'])
+expect_accept(['a/b', 'a/c'])
+`,
+    ],
+    { cwd: path.resolve(__dirname, '..'), encoding: 'utf8' }
+  );
+  assert.equal(result.status, 0, result.error?.message || result.stderr);
+});
+
 test('manifest validation accepts a valid versioned manifest', () => {
   const result = spawnSync(
     'python3',
