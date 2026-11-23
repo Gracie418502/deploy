@@ -421,6 +421,10 @@ If the backend signing key (`BACKEND_SECRET_KEY` / `STELLAR_SECRET_KEY`) or the 
    ```
    Decommission the compromised Stellar account (or set its master weight to `0` via a `set_options` operation) so it can no longer sign transactions.
 
+## 9. Node-drain drill (staging)
+
+Before changing scheduling constraints, disruption budgets, or node pools in production, rehearse a node drain in staging and observe availability and rescheduling. The repeatable drill — including expected PodDisruptionBudget behavior, recovery timing, and cleanup steps — is documented in [`docs/runbooks/kubernetes-node-drain-drill.md`](runbooks/kubernetes-node-drain-drill.md).
+
 ## Troubleshooting
 
 - **Pods stuck in `Pending`** — check node capacity and scheduling constraints (`kubectl describe pod <pod> -n synapsvault`).
