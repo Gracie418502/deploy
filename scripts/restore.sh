@@ -41,6 +41,13 @@
 #                                    (e.g. to update contract ID rows in DB;
 #                                    for repointing env/ConfigMap contract IDs,
 #                                    use scripts/rollback-contracts.cjs instead)
+#   RESTORE_MAX_MEMBERS              Maximum number of archive members allowed
+#                                    (default: 10000). Archives with more
+#                                    members are rejected before extraction.
+#   RESTORE_MAX_UNCOMPRESSED_BYTES   Maximum total uncompressed size of archive
+#                                    members in bytes (default: 10737418240,
+#                                    i.e. 10 GiB). Oversized archives are
+#                                    rejected before extraction.
 #
 # Exit codes:
 #   0  success
@@ -376,8 +383,13 @@ case "$ENCRYPTION_METHOD" in
     ;;
 esac
 
+# Validate the decrypted archive before extraction: reject unsafe paths/types,
+# duplicate normalized member names, and archives exceeding the configured
+# member-count / uncompressed-size budgets.
 python3 "$(dirname "${BASH_SOURCE[0]}")/validate-archive.py" "$ARCHIVE_PATH" \
-  || die 3 "archive contains unsafe paths or file types"
+  --max-members "${RESTORE_MAX_MEMBERS:-10000}" \
+  --max-uncompressed-bytes "${RESTORE_MAX_UNCOMPRESSED_BYTES:-10737418240}" \
+  || die 3 "archive rejected: unsafe paths or file types, duplicate member paths, or exceeds size/member budget"
 EXTRACT_DIR="$(mktemp -d "$WORK_DIR/extracted.XXXXXXXX")"
 tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR" || die 3 "archive is not a valid tar.gz"
 
