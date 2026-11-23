@@ -16,6 +16,16 @@ on:
         required: false
         default: false
         type: boolean
+      build_manifest:
+        description: 'Optional path to a build manifest mapping WASM artifacts to expected checksums'
+        required: false
+        default: ''
+        type: string
+      plan:
+        description: 'Plan only: report network, artifact hashes, signer and planned operations without signing or submitting'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -61,6 +71,9 @@ jobs:
         working-directory: src/contracts
         run: cargo build --release --target wasm32-unknown-unknown --workspace
 
+      # Concurrency guard: the deploy script acquires a lockfile keyed by the
+      # signer public key. Concurrent runs sharing the same Stellar signer fail
+      # fast instead of racing account sequence numbers. Do not remove the lock.
       - name: Deploy contracts
         id: deploy
         env:
@@ -68,7 +81,20 @@ jobs:
           NETWORK: ${{ inputs.network }}
           SOROBAN_RPC_URL: ${{ vars.SOROBAN_RPC_URL }}
           ADMIN_PUBLIC_KEY: ${{ vars.ADMIN_PUBLIC_KEY }}
-        run: node scripts/deploy-contracts.cjs --wasm-dir src/contracts/target/wasm32-unknown-unknown/release --yes
+          BUILD_MANIFEST: ${{ inputs.build_manifest }}
+          PLAN_ONLY: ${{ inputs.plan }}
+        run: |
+          set -euo pipefail
+          args=(--wasm-dir src/contracts/target/wasm32-unknown-unknown/release)
+          if [ -n "${BUILD_MANIFEST:-}" ]; then
+            args+=(--manifest "$BUILD_MANIFEST")
+          fi
+          if [ "${PLAN_ONLY:-false}" = "true" ]; then
+            # Plan mode never signs or submits transactions.
+            node scripts/deploy-contracts.cjs "${args[@]}" --plan
+          else
+            node scripts/deploy-contracts.cjs "${args[@]}" --yes
+          fi
 
       - name: Collect contract IDs
         id: ids
@@ -86,6 +112,14 @@ jobs:
         with:
           name: contract-ids-${{ inputs.network }}
           path: contract-ids.json
+          if-no-files-found: warn
+
+      - name: Upload deployment record
+        if: ${{ !inputs.plan }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-record-${{ inputs.network }}
+          path: deployment-record.json
           if-no-files-found: warn
 
   update-configmap:
