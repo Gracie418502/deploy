@@ -332,6 +332,17 @@ Each probe sets:
 - **`timeoutSeconds`** — how long to wait for a response.
 - **`failureThreshold` / `successThreshold`** — how many consecutive failures/successes trigger a state change.
 
+### Frontend probes and routing
+
+The frontend container serves a dedicated health endpoint at `/healthz` that is handled independently of the SPA fallback, so a missing asset can never masquerade as a healthy response. The frontend `Deployment` uses `/healthz` for its startup, liveness, and readiness probes.
+
+nginx routing separates static asset requests from navigation fallback:
+
+- Requests under `/assets/` (and other static files) are served directly. A missing JavaScript or CSS file returns **404** instead of the SPA shell.
+- Any other path (e.g. `/dashboard`, `/leases/123`) falls back to `index.html` so client-side routes still work on a hard refresh or deep link.
+
+At startup the container validates the required runtime configuration (`APP_API_URL` and `APP_NETWORK`) before rendering `config.js`. If a value is missing or invalid, the container exits with a clear field-level error (e.g. `APP_API_URL: must be a valid URL`) and the pod goes into `CrashLoopBackOff`; check `kubectl logs <pod> -n synapsvault` for the offending field. Relative API URLs (e.g. `/api`) remain supported.
+
 Inspect probe behavior:
 
 ```sh
@@ -339,6 +350,21 @@ kubectl describe pod <pod> -n synapsvault
 ```
 
 Look at the `Startup`/`Liveness`/`Readiness` sections and the `Events` at the bottom for probe failures.
+
+Verify the frontend routing and health endpoint from inside a frontend pod:
+
+```sh
+POD=$(kubectl get pod -n synapsvault -l app=frontend -o jsonpath='{.items[0].metadata.name}')
+
+# Health endpoint returns the explicit health body
+kubectl exec -n synapsvault "$POD" -- curl -fsS http://localhost/healthz
+
+# A missing static asset returns 404, not index.html
+kubectl exec -n synapsvault "$POD" -- curl -s -o /dev/null -w '%{http_code}\n' http://localhost/assets/missing.js
+
+# A client-side route still serves the SPA shell
+kubectl exec -n synapsvault "$POD" -- curl -fsS http://localhost/dashboard | head -n 5
+```
 
 ## 8. Emergency Key Rotation (Contract Admin & Backend Signing Key)
 

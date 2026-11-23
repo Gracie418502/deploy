@@ -78,7 +78,10 @@ RUN printf '%s\n' \
     '    add_header X-XSS-Protection "1; mode=block" always;' \
     '    add_header Referrer-Policy "strict-origin-when-cross-origin" always;' \
     '    add_header Content-Security-Policy "default-src '\''self'\''; script-src '\''self'\''; style-src '\''self'\'' '\''unsafe-inline'\''; img-src '\''self'\'' data:; font-src '\''self'\'' data:; connect-src '\''self'\''; frame-ancestors '\''none'\''; base-uri '\''self'\''; form-action '\''self'\'';" always;' \
+    '    location = /healthz { access_log off; add_header Cache-Control "no-store"; default_type text/plain; return 200 "ok\n"; }' \
     '    location = /config.js { alias /tmp/config.js; add_header Cache-Control "no-store"; }' \
+    '    location /assets/ { try_files $uri =404; }' \
+    '    location ~* \.(?:js|css|map|png|jpg|jpeg|gif|svg|webp|ico|woff2?|ttf|eot)$ { try_files $uri =404; }' \
     '    location / { try_files $uri $uri/ /index.html; }' \
     '  }' \
     '}' > /etc/nginx/nginx.conf \
@@ -101,7 +104,23 @@ ENV APP_API_URL=/api \
 RUN printf '%s\n' \
     '#!/bin/sh' \
     'set -eu' \
-    'jq -n --arg apiUrl "$APP_API_URL" --arg network "$APP_NETWORK" --arg sentryDsn "$APP_SENTRY_DSN" "{apiUrl: \$apiUrl, network: \$network, sentryDsn: \$sentryDsn}" | sed "1s/^/window.__APP_CONFIG__ = /; \$s/\$/;/" > /tmp/config.js' \
+    'fail() { echo "config error: $1" >&2; exit 1; }' \
+    'if [ -z "${APP_API_URL:-}" ]; then' \
+    '  fail "APP_API_URL must be set"' \
+    'fi' \
+    'case "$APP_API_URL" in' \
+    '  /*) ;;' \
+    '  http://*|https://*) ;;' \
+    '  *) fail "APP_API_URL must be a relative path starting with / or an http(s) URL" ;;' \
+    'esac' \
+    'if [ -z "${APP_NETWORK:-}" ]; then' \
+    '  fail "APP_NETWORK must be set"' \
+    'fi' \
+    'case "$APP_NETWORK" in' \
+    '  testnet|mainnet|futurenet) ;;' \
+    '  *) fail "APP_NETWORK must be one of: testnet, mainnet, futurenet" ;;' \
+    'esac' \
+    'jq -n --arg apiUrl "$APP_API_URL" --arg network "$APP_NETWORK" --arg sentryDsn "${APP_SENTRY_DSN:-}" "{apiUrl: \$apiUrl, network: \$network, sentryDsn: \$sentryDsn}" | sed "1s/^/window.__APP_CONFIG__ = /; \$s/\$/;/" > /tmp/config.js' \
     > /docker-entrypoint.d/40-generate-config.sh \
     && chmod +x /docker-entrypoint.d/40-generate-config.sh
 
@@ -109,6 +128,6 @@ USER 101
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget -qO- http://127.0.0.1:8080/ >/dev/null || exit 1
+    CMD wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1
 
 CMD ["nginx", "-g", "daemon off;"]

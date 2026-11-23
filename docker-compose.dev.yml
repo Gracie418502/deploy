@@ -26,3 +26,8 @@ services:
       - /app/node_modules
     environment:
       - NODE_ENV=development
+    # NOTE: The production compose file defines a healthcheck that targets
+    # `/healthz`, which is served by the nginx configuration in the production
+    # image. The Vite dev server used here does not serve `/healthz`, so no
+    # healthcheck is defined in this dev override. Do not add a `/healthz`
+    # probe here without also adding a matching route to the dev server.
