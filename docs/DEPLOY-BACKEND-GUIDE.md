@@ -71,3 +71,39 @@ contains, for each check:
 
 The script still exits with a **nonzero status** when any check fails. Reports
 never contain admin credentials or other secrets.
+## Smoke-test configuration requirements
+
+The post-deployment smoke test (`scripts/06-smoke-test.js`) validates its
+configuration **before making any network calls**. If any of the checks below
+fail, the script exits with a redacted configuration error so you can fix the
+environment without leaking secrets into logs.
+
+### `SMOKE_READY_TIMEOUT_MS`
+
+- Must be a **finite, positive** number of milliseconds.
+- Nonfinite values (`NaN`, `Infinity`), negative values, and zero are rejected
+  with a configuration error before any requests are sent.
+- Example: `SMOKE_READY_TIMEOUT_MS=30000`
+
+### `ADMIN_API_KEY`
+
+- Must be set **explicitly**; the script no longer silently falls back to
+  `change_me`.
+- Placeholder values (such as `change_me`) are rejected.
+- Missing or placeholder keys produce an early, redacted configuration error.
+- The key is never printed in full in error output.
+
+### Base URL normalization
+
+- The base URL is parsed and normalized before endpoint paths are joined, so a
+  trailing slash does not produce double-slash requests.
+- Both a root base URL (e.g. `https://api.example.com`) and an `/api` base path
+  (e.g. `https://api.example.com/api`) are supported, and the intended route
+  prefix is preserved when joining endpoint paths.
+
+### Redirect policy for authenticated checks
+
+- Authenticated endpoint checks use an explicit redirect policy.
+- A cross-origin redirect **fails** the check without forwarding the
+  `X-Admin-Key` header to the redirected origin, so admin credentials are never
+  sent to a different host.

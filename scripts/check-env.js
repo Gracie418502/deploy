@@ -37,6 +37,7 @@
 
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { StrKey, Keypair } from '@stellar/stellar-sdk';
 
 // ---------------------------------------------------------------------------
 // Placeholder detection
@@ -74,6 +75,70 @@ const PLACEHOLDER_PATTERNS = [
 function isPlaceholder(value) {
   if (value === '' || value === undefined || value === null) return false; // handled by "missing" check
   return PLACEHOLDER_PATTERNS.some((re) => re.test(value));
+}
+
+/**
+ * Returns true if the value should be treated as missing: undefined, null,
+ * empty, or whitespace-only (including quoted whitespace such as `" "`).
+ *
+ * Only the presence check uses this; the original value is preserved for
+ * semantic checks so secrets that legitimately contain internal spaces are
+ * not altered.
+ *
+ * @param {string|undefined|null} value
+ * @returns {boolean}
+ */
+function isBlank(value) {
+  if (value === undefined || value === null) return true;
+  if (typeof value !== 'string') return false;
+  if (value.trim() !== '') return false;
+  // Quoted whitespace, e.g. `" "` or `'  '`, is also considered blank.
+  const unquoted = value.replace(/^(['"])(.*)\1$/s, '$2');
+  return unquoted.trim() === '';
+}
+
+// ---------------------------------------------------------------------------
+// Semantic validation helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Supported Stellar network identifiers. Values are compared case-insensitively.
+ * @type {string[]}
+ */
+const SUPPORTED_NETWORKS = ['testnet', 'mainnet', 'futurenet', 'standalone'];
+
+/**
+ * Field kinds that receive StrKey validation.
+ * @type {Record<string, 'publicKey'|'secretSeed'|'contract'>}
+ */
+const STRKEY_FIELDS = {
+  STELLAR_PUBLIC_KEY: 'publicKey',
+  PAY_TO: 'publicKey',
+  STELLAR_SECRET_KEY: 'secretSeed',
+  AGENT_SECRET_KEY: 'secretSeed',
+  REGISTRY_SECRET_KEY: 'secretSeed',
+  STELLAR_CONTRACT_VAULT_REGISTRY: 'contract',
+  STELLAR_CONTRACT_ACCESS_LEASE: 'contract',
+  STELLAR_CONTRACT_SUBSCRIPTION: 'contract',
+  USDC_CONTRACT_ID: 'contract',
+};
+
+/**
+ * Validate a StrKey-encoded value for the given kind.
+ *
+ * @param {string} value
+ * @param {'publicKey'|'secretSeed'|'contract'} kind
+ * @returns {boolean}
+ */
+function isValidStrKey(value, kind) {
+  try {
+    if (kind === 'publicKey') return StrKey.isValidEd25519PublicKey(value);
+    if (kind === 'secretSeed') return StrKey.isValidEd25519SecretSeed(value);
+    if (kind === 'contract') return StrKey.isValidContract(value);
+  } catch {
+    return false;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -233,9 +298,12 @@ export function parseEnvFile(filePath) {
 /**
  * @typedef {Object} ValidationResult
  * @property {boolean}  ok
- * @property {string[]} missing     Variables not set at all
- * @property {string[]} placeholder Variables set to a placeholder value
- * @property {string[]} invalidUrl  URL values with invalid syntax or protocols
+ * @property {string[]} missing        Variables not set at all (or blank/whitespace-only)
+ * @property {string[]} placeholder    Variables set to a placeholder value
+ * @property {string[]} invalidUrl     URL values with invalid syntax or protocols
+ * @property {string[]} invalidNetwork STELLAR_NETWORK values outside the allowlist
+ * @property {string[]} invalidKey     StrKey fields with invalid encoding/checksum
+ * @property {string[]} keyMismatch    STELLAR_PUBLIC_KEY does not match STELLAR_SECRET_KEY
  */
 
 /**
@@ -250,34 +318,88 @@ export function validateEnv(specs, fileEnv, target) {
   const missing = [];
   const placeholder = [];
   const invalidUrl = [];
+  const invalidNetwork = [];
+  const invalidKey = [];
+  const keyMismatch = [];
+
+  /** @type {Record<string, string>} */
+  const resolved = {};
 
   for (const spec of specs) {
     // process.env takes precedence over the file (mirrors how dotenv works in apps)
     const value = process.env[spec.name] ?? fileEnv[spec.name];
-    if (value === undefined || value === null || value === '') {
+    if (isBlank(value)) {
       missing.push(spec.name);
-    } else if (isPlaceholder(value)) {
+      continue;
+    }
+    resolved[spec.name] = value;
+    if (isPlaceholder(value)) {
       placeholder.push(spec.name);
-    } else {
-      const allowedProtocols = URL_PROTOCOLS[target][spec.name];
-      if (allowedProtocols) {
-        try {
-          const url = new URL(value);
-          if (!allowedProtocols.includes(url.protocol) || !url.hostname) {
-            invalidUrl.push(spec.name);
-          }
-        } catch {
+      continue;
+    }
+
+    const allowedProtocols = URL_PROTOCOLS[target][spec.name];
+    if (allowedProtocols) {
+      try {
+        const url = new URL(value);
+        if (!allowedProtocols.includes(url.protocol) || !url.hostname) {
           invalidUrl.push(spec.name);
         }
+      } catch {
+        invalidUrl.push(spec.name);
+      }
+    }
+
+    if (spec.name === 'STELLAR_NETWORK') {
+      if (!SUPPORTED_NETWORKS.includes(value.trim().toLowerCase())) {
+        invalidNetwork.push(spec.name);
+      }
+    }
+
+    const strKeyKind = STRKEY_FIELDS[spec.name];
+    if (strKeyKind && !isValidStrKey(value, strKeyKind)) {
+      invalidKey.push(spec.name);
+    }
+  }
+
+  // Cross-field check: derive the public key from the secret and compare.
+  // Only run when both values are present and individually valid, and never
+  // include either key or derived material in the result.
+  const secret = resolved.STELLAR_SECRET_KEY;
+  const publicKey = resolved.STELLAR_PUBLIC_KEY;
+  if (
+    secret !== undefined &&
+    publicKey !== undefined &&
+    !invalidKey.includes('STELLAR_SECRET_KEY') &&
+    !invalidKey.includes('STELLAR_PUBLIC_KEY')
+  ) {
+    try {
+      const derived = Keypair.fromSecret(secret).publicKey();
+      if (derived !== publicKey) {
+        keyMismatch.push('STELLAR_PUBLIC_KEY');
+      }
+    } catch {
+      // A secret that cannot be parsed was already reported via invalidKey.
+      if (!invalidKey.includes('STELLAR_SECRET_KEY')) {
+        invalidKey.push('STELLAR_SECRET_KEY');
       }
     }
   }
 
   return {
-    ok: missing.length === 0 && placeholder.length === 0 && invalidUrl.length === 0,
+    ok:
+      missing.length === 0 &&
+      placeholder.length === 0 &&
+      invalidUrl.length === 0 &&
+      invalidNetwork.length === 0 &&
+      invalidKey.length === 0 &&
+      keyMismatch.length === 0,
     missing,
     placeholder,
     invalidUrl,
+    invalidNetwork,
+    invalidKey,
+    keyMismatch,
   };
 }
 
@@ -346,7 +468,8 @@ Options:
 
 Exit codes:
   0  All checks passed
-  1  Missing variables, placeholders, invalid URLs, or invalid arguments
+  1  Missing variables, placeholders, invalid URLs, invalid Stellar
+     network/keys, key mismatches, or invalid arguments
 `.trim();
 
 /**
@@ -383,7 +506,8 @@ export function run(argv = process.argv.slice(2), cwd = process.cwd()) {
   const fileEnv = parseEnvFile(resolvedEnvFile);
   const specs = TARGETS[target];
 
-  const { ok, missing, placeholder, invalidUrl } = validateEnv(specs, fileEnv, target);
+  const { ok, missing, placeholder, invalidUrl, invalidNetwork, invalidKey, keyMismatch } =
+    validateEnv(specs, fileEnv, target);
 
   const targetLabel = target.toUpperCase();
 
@@ -427,6 +551,48 @@ export function run(argv = process.argv.slice(2), cwd = process.cwd()) {
     for (const name of invalidUrl) {
       console.error(`  • ${name} (allowed: ${URL_PROTOCOLS[target][name].join(', ')})`);
     }
+    console.error('');
+  }
+
+  if (invalidNetwork.length > 0) {
+    console.error(`Invalid STELLAR_NETWORK values (unsupported network):`);
+    for (const name of invalidNetwork) {
+      console.error(
+        `  • ${name}="${process.env[name] ?? fileEnv[name] ?? ''}"` +
+          `  — must be one of: ${SUPPORTED_NETWORKS.join(', ')}`
+      );
+    }
+    console.error('');
+  }
+
+  if (invalidKey.length > 0) {
+    console.error(`Invalid Stellar key/contract values (bad encoding or checksum):`);
+    for (const name of invalidKey) {
+      const spec = specs.find((s) => s.name === name);
+      const kind = STRKEY_FIELDS[name];
+      const expected =
+        kind === 'publicKey'
+          ? 'a valid Ed25519 public key (G...)'
+          : kind === 'secretSeed'
+            ? 'a valid Ed25519 secret seed (S...)'
+            : 'a valid contract ID (C...)';
+      // Never echo secret values; non-secret values are shown truncated.
+      const rawValue = process.env[name] ?? fileEnv[name] ?? '';
+      const displayValue = spec?.secret
+        ? '[redacted]'
+        : rawValue.length > 50
+          ? rawValue.slice(0, 50) + '…'
+          : rawValue;
+      console.error(`  • ${name}="${displayValue}"  — expected ${expected}`);
+    }
+    console.error('');
+  }
+
+  if (keyMismatch.length > 0) {
+    console.error(
+      `STELLAR_PUBLIC_KEY does not match the public key derived from STELLAR_SECRET_KEY.\n` +
+        `  • Ensure both values come from the same Stellar keypair (values are not shown).`
+    );
     console.error('');
   }
 

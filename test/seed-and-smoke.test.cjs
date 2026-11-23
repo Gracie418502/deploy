@@ -232,4 +232,136 @@ test('06-smoke-test.js --frontend-url fails when config.js targets the wrong env
   assert.equal(status, 1);
   assert.match(stderr, /frontend/i);
   assert.match(stdout, /6 passed  \/  1 failed/);
+test('06-smoke-test.js rejects invalid SMOKE_READY_TIMEOUT_MS before any network calls', () => {
+  for (const value of ['NaN', 'Infinity', '-1', '0']) {
+    const { status, stderr, requested } = runWithStub(
+      SMOKE_SCRIPT,
+      [],
+      { SMOKE_READY_TIMEOUT_MS: value }
+    );
+
+    assert.equal(status, 1, `expected exit 1 for SMOKE_READY_TIMEOUT_MS=${value}`);
+    assert.match(
+      stderr,
+      /SMOKE_READY_TIMEOUT_MS/,
+      `expected configuration error mentioning SMOKE_READY_TIMEOUT_MS for ${value}`
+    );
+    assert.equal(
+      requested.length,
+      0,
+      `expected no network calls for SMOKE_READY_TIMEOUT_MS=${value}`
+    );
+  }
+});
+
+test('06-smoke-test.js normalizes a root base URL without double slashes', () => {
+  const { status, requested } = runWithStub(
+    SMOKE_SCRIPT,
+    [
+      { status: 200, json: { status: 'healthy' } },
+      { status: 200, json: { status: 'healthy' } },
+      { status: 200, json: { resourceCount: 3 } },
+      { status: 200, json: { resources: [{ id: 'res-1' }, { id: 'res-2' }] } },
+      { status: 402, json: { error: 'Payment Required' } },
+      { status: 401, json: {} },
+      { status: 403, json: {} },
+      { status: 200, json: { resources: 2, publishers: 2 } },
+      { status: 200, text: '<html>Swagger</html>' },
+    ],
+    { BACKEND_URL: 'https://host/' }
+  );
+
+  assert.equal(status, 0);
+  assert.ok(requested.length > 0);
+  for (const url of requested) {
+    assert.ok(
+      !/https?:\/\/[^/]*\/\//.test(url),
+      `expected no double slash in request URL: ${url}`
+    );
+  }
+});
+
+test('06-smoke-test.js preserves an /api base path prefix', () => {
+  const { status, requested } = runWithStub(
+    SMOKE_SCRIPT,
+    [
+      { status: 200, json: { status: 'healthy' } },
+      { status: 200, json: { status: 'healthy' } },
+      { status: 200, json: { resourceCount: 3 } },
+      { status: 200, json: { resources: [{ id: 'res-1' }, { id: 'res-2' }] } },
+      { status: 402, json: { error: 'Payment Required' } },
+      { status: 401, json: {} },
+      { status: 403, json: {} },
+      { status: 200, json: { resources: 2, publishers: 2 } },
+      { status: 200, text: '<html>Swagger</html>' },
+    ],
+    { BACKEND_URL: 'https://host/api/' }
+  );
+
+  assert.equal(status, 0);
+  assert.ok(requested.length > 0);
+  for (const url of requested) {
+    assert.ok(
+      !/https?:\/\/[^/]*\/\//.test(url),
+      `expected no double slash in request URL: ${url}`
+    );
+    assert.ok(
+      url.startsWith('https://host/api/'),
+      `expected /api prefix preserved in request URL: ${url}`
+    );
+  }
+});
+
+test('06-smoke-test.js rejects missing and placeholder ADMIN_API_KEY before any network calls', () => {
+  const cases = [
+    { label: 'missing', env: { ADMIN_API_KEY: '' } },
+    { label: 'placeholder', env: { ADMIN_API_KEY: 'change_me' } },
+  ];
+
+  for (const { label, env } of cases) {
+    const { status, stderr, requested } = runWithStub(SMOKE_SCRIPT, [], env);
+
+    assert.equal(status, 1, `expected exit 1 for ${label} ADMIN_API_KEY`);
+    assert.match(
+      stderr,
+      /ADMIN_API_KEY/,
+      `expected configuration error mentioning ADMIN_API_KEY for ${label} key`
+    );
+    assert.ok(
+      !stderr.includes('change_me'),
+      `expected redacted error for ${label} key, got: ${stderr}`
+    );
+    assert.equal(
+      requested.length,
+      0,
+      `expected no network calls for ${label} ADMIN_API_KEY`
+    );
+  }
+});
+
+test('06-smoke-test.js fails cross-origin redirect without forwarding X-Admin-Key', () => {
+  const { status, stderr, requested } = runWithStub(SMOKE_SCRIPT, [
+    { status: 200, json: { status: 'healthy' } },
+    { status: 200, json: { status: 'healthy' } },
+    { status: 200, json: { resourceCount: 3 } },
+    { status: 200, json: { resources: [{ id: 'res-1' }, { id: 'res-2' }] } },
+    { status: 402, json: { error: 'Payment Required' } },
+    {
+      status: 302,
+      headers: { location: 'https://evil.example.com/admin/stats' },
+      json: {},
+    },
+    { status: 403, json: {} },
+    { status: 200, json: { resources: 2, publishers: 2 } },
+    { status: 200, text: '<html>Swagger</html>' },
+  ]);
+
+  assert.equal(status, 1);
+  assert.match(stderr, /redirect/i);
+  for (const url of requested) {
+    assert.ok(
+      !url.startsWith('https://evil.example.com'),
+      `expected no request to redirected origin, got: ${url}`
+    );
+  }
 });
