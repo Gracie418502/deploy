@@ -64,6 +64,15 @@ PROM_JOB_NAME="${PROM_JOB_NAME:-soroban_backup}"
 #   - a path to a key file
 BACKUP_ENCRYPTION_KEY="${BACKUP_ENCRYPTION_KEY:-}"
 BACKUP_ENCRYPTION_METHOD="${BACKUP_ENCRYPTION_METHOD:-auto}" # auto|age|gpg|none
+# Optional path to an age recipients file containing one or more public
+# recipients (one per line, blank lines and '#' comments ignored). When set,
+# the archive is encrypted to every recipient in the file so that any one of
+# the authorized custodians can decrypt it. Only public recipients belong in
+# this file; private identities must never be stored alongside the backup.
+BACKUP_AGE_RECIPIENTS_FILE="${BACKUP_AGE_RECIPIENTS_FILE:-}"
+# Optional path to an age identity file used only for verification/decryption
+# during tests. It is never read by the backup pipeline itself.
+BACKUP_AGE_IDENTITY_FILE="${BACKUP_AGE_IDENTITY_FILE:-}"
 
 # Storage settings.
 BACKUP_STORAGE_PROVIDER="${BACKUP_STORAGE_PROVIDER:-s3}" # s3|supabase
@@ -114,8 +123,24 @@ BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-30}"
 BACKUP_VERBOSE="${BACKUP_VERBOSE:-0}"
 BACKUP_OUTPUT_DIR="${BACKUP_OUTPUT_DIR:-}"
 
+# Dry-run mode: print the plan (components, destination, retention actions)
+# with credentials redacted, then exit without dumping, uploading or deleting.
+BACKUP_DRY_RUN="${BACKUP_DRY_RUN:-0}"
+
 # Set by main(); read by the EXIT trap to report failure metrics.
 START_TS=""
+
+# Phase status tracking. Upload and retention are tracked independently so a
+# pruning failure never masks a successful (recoverable) upload.
+# Values: pending | success | failed | skipped
+UPLOAD_STATUS="pending"
+RETENTION_STATUS="pending"
+UPLOAD_ERROR=""
+RETENTION_ERROR=""
+UPLOADED_OBJECT_KEY=""
+UPLOADED_SIZE_BYTES="0"
+UPLOADED_CHECKSUM=""
+=======
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -136,6 +161,22 @@ debug() {
   fi
 }
 
+# Redact a value for display: show only a short prefix and a length hint so
+# operators can confirm configuration without leaking credentials.
+redact() {
+  local value="${1:-}"
+  if [[ -z "${value}" ]]; then
+    printf '<unset>'
+    return 0
+  fi
+  local len=${#value}
+  if [[ "${len}" -le 4 ]]; then
+    printf '***'
+  else
+    printf '%s*** (len=%d)' "${value:0:2}" "${len}"
+  fi
+}
+
 die() {
   local code="${1:-1}"; shift
   error "$@"
@@ -151,8 +192,16 @@ cleanup() {
   if [[ "${exit_code}" -ne 0 && -n "${START_TS}" ]]; then
     local end_ts
     end_ts="$(date -u +%s)"
-    emit_metrics 0 "$(( end_ts - START_TS ))" 0 "$(previous_last_success)" \
-      "backup failed with exit code ${exit_code}" || true
+    # If the upload already succeeded, the backup is recoverable even though
+    # the run failed later (e.g. during retention cleanup). Report the upload
+    # outcome separately so operators know a usable archive exists.
+    local overall_success=0
+    local err_msg="backup failed with exit code ${exit_code}"
+    if [[ "${UPLOAD_STATUS}" == "success" ]]; then
+      err_msg="backup failed after successful upload (exit ${exit_code}); retention=${RETENTION_STATUS}"
+    fi
+    emit_metrics "${overall_success}" "$(( end_ts - START_TS ))" \
+      "${UPLOADED_SIZE_BYTES}" "$(previous_last_success)" "${err_msg}" || true
     error "Backup failed with exit code ${exit_code}"
   fi
   if [[ "${CLEANUP_WORK_DIR}" == "1" && -d "${WORK_DIR}" ]]; then
@@ -197,8 +246,10 @@ check_dependencies() {
     none) warn "Encryption explicitly disabled (BACKUP_ENCRYPTION_METHOD=none)" ;;
     auto)
       # age cannot read a passphrase non-interactively, so it is only chosen
-      # for age recipients (age1...) or recipient files; passphrases use gpg.
-      if [[ ( "${BACKUP_ENCRYPTION_KEY}" == age1* || -f "${BACKUP_ENCRYPTION_KEY}" ) ]] \
+      # for age recipients (age1...), recipient files, or an explicit
+      # BACKUP_AGE_RECIPIENTS_FILE; passphrases use gpg.
+      if [[ ( "${BACKUP_ENCRYPTION_KEY}" == age1* || -f "${BACKUP_ENCRYPTION_KEY}" \
+              || -n "${BACKUP_AGE_RECIPIENTS_FILE}" ) ]] \
           && command -v age >/dev/null 2>&1; then
         BACKUP_ENCRYPTION_METHOD="age"
       elif command -v gpg >/dev/null 2>&1; then
@@ -213,12 +264,23 @@ check_dependencies() {
       ;;
   esac
 
-  if [[ "${BACKUP_ENCRYPTION_METHOD}" != "none" && -z "${BACKUP_ENCRYPTION_KEY}" ]]; then
-    die 2 "BACKUP_ENCRYPTION_KEY is required when encryption is enabled"
+  if [[ "${BACKUP_ENCRYPTION_METHOD}" == "age" && -n "${BACKUP_AGE_RECIPIENTS_FILE}" ]]; then
+    if [[ ! -f "${BACKUP_AGE_RECIPIENTS_FILE}" ]]; then
+      die 2 "BACKUP_AGE_RECIPIENTS_FILE does not exist: ${BACKUP_AGE_RECIPIENTS_FILE}"
+    fi
+    if ! grep -Eq '^[[:space:]]*age1[0-9a-z]+' "${BACKUP_AGE_RECIPIENTS_FILE}"; then
+      die 2 "BACKUP_AGE_RECIPIENTS_FILE contains no age1... recipients"
+    fi
+  fi
+
+  if [[ "${BACKUP_ENCRYPTION_METHOD}" != "none" && -z "${BACKUP_ENCRYPTION_KEY}" \
+      && -z "${BACKUP_AGE_RECIPIENTS_FILE}" ]]; then
+    die 2 "BACKUP_ENCRYPTION_KEY or BACKUP_AGE_RECIPIENTS_FILE is required when encryption is enabled"
   fi
 
   if [[ "${BACKUP_ENCRYPTION_METHOD}" == "age" \
-      && "${BACKUP_ENCRYPTION_KEY}" != age1* && ! -f "${BACKUP_ENCRYPTION_KEY}" ]]; then
+      && "${BACKUP_ENCRYPTION_KEY}" != age1* && ! -f "${BACKUP_ENCRYPTION_KEY}" \
+      && -z "${BACKUP_AGE_RECIPIENTS_FILE}" ]]; then
     die 2 "age needs an age1... recipient or a recipients file; use gpg for passphrases"
   fi
 
@@ -249,10 +311,31 @@ emit_metrics() {
   local payload_file="${WORK_DIR}/soroban_backup.prom"
   mkdir -p "${WORK_DIR}"
 
+  # Map phase statuses to numeric gauges: 1=success, 0=failed/skipped/pending.
+  local upload_ok=0 retention_ok=0
+  [[ "${UPLOAD_STATUS}" == "success" ]] && upload_ok=1
+  [[ "${RETENTION_STATUS}" == "success" || "${RETENTION_STATUS}" == "skipped" ]] && retention_ok=1
+
   {
     printf '# HELP soroban_backup_success Whether the last backup run succeeded (1=success, 0=failure).\n'
     printf '# TYPE soroban_backup_success gauge\n'
     printf 'soroban_backup_success %s\n' "${success}"
+
+    printf '# HELP soroban_backup_upload_success Whether the archive upload succeeded (1=success, 0=failure).\n'
+    printf '# TYPE soroban_backup_upload_success gauge\n'
+    printf 'soroban_backup_upload_success %s\n' "${upload_ok}"
+
+    printf '# HELP soroban_backup_retention_success Whether retention cleanup succeeded (1=success/skipped, 0=failure).\n'
+    printf '# TYPE soroban_backup_retention_success gauge\n'
+    printf 'soroban_backup_retention_success %s\n' "${retention_ok}"
+
+    printf '# HELP soroban_backup_upload_status Upload phase status (1=success, 0=failed/skipped/pending).\n'
+    printf '# TYPE soroban_backup_upload_status gauge\n'
+    printf 'soroban_backup_upload_status{status="%s"} 1\n' "${UPLOAD_STATUS}"
+
+    printf '# HELP soroban_backup_retention_status Retention phase status (1=success, 0=failed/skipped/pending).\n'
+    printf '# TYPE soroban_backup_retention_status gauge\n'
+    printf 'soroban_backup_retention_status{status="%s"} 1\n' "${RETENTION_STATUS}"
 
     printf '# HELP soroban_backup_last_success_timestamp_seconds Unix timestamp of the last successful backup.\n'
     printf '# TYPE soroban_backup_last_success_timestamp_seconds gauge\n'
@@ -276,6 +359,22 @@ emit_metrics() {
       local escaped
       escaped="$(printf '%s' "${error_message}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\n/ /g')"
       printf 'soroban_backup_last_error_info{message="%s"} 1\n' "${escaped}"
+    fi
+
+    if [[ -n "${UPLOAD_ERROR}" ]]; then
+      printf '# HELP soroban_backup_upload_error_info Information about the last upload error (always 1).\n'
+      printf '# TYPE soroban_backup_upload_error_info gauge\n'
+      local up_escaped
+      up_escaped="$(printf '%s' "${UPLOAD_ERROR}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\n/ /g')"
+      printf 'soroban_backup_upload_error_info{message="%s"} 1\n' "${up_escaped}"
+    fi
+
+    if [[ -n "${RETENTION_ERROR}" ]]; then
+      printf '# HELP soroban_backup_retention_error_info Information about the last retention error (always 1).\n'
+      printf '# TYPE soroban_backup_retention_error_info gauge\n'
+      local ret_escaped
+      ret_escaped="$(printf '%s' "${RETENTION_ERROR}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\n/ /g')"
+      printf 'soroban_backup_retention_error_info{message="%s"} 1\n' "${ret_escaped}"
     fi
   } > "${payload_file}"
 
@@ -636,8 +735,25 @@ encrypt_archive() {
       info "Encrypting archive with age"
       local recipient="${BACKUP_ENCRYPTION_KEY}"
       # check_dependencies already verified that BACKUP_ENCRYPTION_KEY is either
-      # an existing recipients file or an age1... recipient public key.
-      if [[ -f "${BACKUP_ENCRYPTION_KEY}" ]]; then
+      # an existing recipients file or an age1... recipient public key, and that
+      # BACKUP_AGE_RECIPIENTS_FILE (if set) contains at least one recipient.
+      if [[ -n "${BACKUP_AGE_RECIPIENTS_FILE}" ]]; then
+        # Encrypt to every recipient in the file so any authorized custodian
+        # can decrypt. Only public recipients are read; identities stay out.
+        local -a recipient_args=()
+        local line
+        while IFS= read -r line; do
+          line="$(printf '%s' "${line}" | tr -d '[:space:]')"
+          [[ -z "${line}" || "${line}" == \#* ]] && continue
+          recipient_args+=(--recipient "${line}")
+        done < "${BACKUP_AGE_RECIPIENTS_FILE}"
+        if [[ ${#recipient_args[@]} -eq 0 ]]; then
+          die 2 "BACKUP_AGE_RECIPIENTS_FILE contains no usable recipients"
+        fi
+        debug "Encrypting to ${#recipient_args[@]} age recipient(s) from ${BACKUP_AGE_RECIPIENTS_FILE}"
+        age --encrypt "${recipient_args[@]}" \
+          --output "${output}" "${input}"
+      elif [[ -f "${BACKUP_ENCRYPTION_KEY}" ]]; then
         age --encrypt --recipients-file "${BACKUP_ENCRYPTION_KEY}" \
           --output "${output}" "${input}"
       elif [[ "${BACKUP_ENCRYPTION_KEY}" == age1* ]]; then
@@ -807,6 +923,10 @@ write_manifest() {
     "bucket": "$(json_escape "${BACKUP_STORAGE_BUCKET}")",
     "key": "$(json_escape "${object_key}")"
   },
+  "status": {
+    "upload": "$(json_escape "${UPLOAD_STATUS}")",
+    "retention": "$(json_escape "${RETENTION_STATUS}")"
+  },
   "source": {
     "hostname": "$(json_escape "${hostname}")",
     "environment": "$(json_escape "${environment}")",
@@ -832,7 +952,76 @@ write_manifest() {
 }
 EOF
 
+  # Record the final phase statuses once known. The manifest is written before
+  # upload, so statuses are patched in afterwards by update_manifest_status.
   debug "Manifest written to ${MANIFEST_PATH}"
+}
+
+# Patch the manifest's status block in place after upload/retention complete.
+update_manifest_status() {
+  [[ -f "${MANIFEST_PATH}" ]] || return 0
+  local tmp
+  tmp="$(mktemp "${MANIFEST_PATH}.XXXXXX")"
+  awk -v up="${UPLOAD_STATUS}" -v ret="${RETENTION_STATUS}" '
+    /"status": \{/ { in_status=1 }
+    in_status && /"upload":/ { sub(/"upload": "[^"]*"/, "\"upload\": \"" up "\""); print; next }
+    in_status && /"retention":/ { sub(/"retention": "[^"]*"/, "\"retention\": \"" ret "\""); print; in_status=0; next }
+    { print }
+  ' "${MANIFEST_PATH}" > "${tmp}" && mv -f "${tmp}" "${MANIFEST_PATH}"
+}
+
+# ---------------------------------------------------------------------------
+# Dry-run plan
+# ---------------------------------------------------------------------------
+
+# Print the planned components, destination and retention actions with all
+# credentials redacted. Performs no dumps, uploads or deletions.
+print_dry_run_plan() {
+  local db_planned="yes" contracts_planned="yes"
+  [[ "${BACKUP_SKIP_DB}" == "1" ]] && db_planned="no (BACKUP_SKIP_DB=1)"
+  [[ "${BACKUP_SKIP_CONTRACTS}" == "1" ]] && contracts_planned="no (BACKUP_SKIP_CONTRACTS=1)"
+
+  local upload_planned="yes"
+  [[ "${BACKUP_SKIP_UPLOAD}" == "1" ]] && upload_planned="no (BACKUP_SKIP_UPLOAD=1)"
+
+  local prune_planned="yes"
+  if [[ "${BACKUP_SKIP_UPLOAD}" == "1" || "${BACKUP_SKIP_PRUNE}" == "1" ]]; then
+    prune_planned="no (skipped)"
+  elif [[ -z "${BACKUP_RETENTION_DAYS}" || "${BACKUP_RETENTION_DAYS}" -le 0 ]]; then
+    prune_planned="no (retention disabled)"
+  fi
+
+  local enc_desc="${BACKUP_ENCRYPTION_METHOD}"
+  if [[ "${BACKUP_ENCRYPTION_METHOD}" == "age" && -n "${BACKUP_AGE_RECIPIENTS_FILE}" ]]; then
+    local n_recipients
+    n_recipients="$(grep -Ec '^[[:space:]]*age1[0-9a-z]+' "${BACKUP_AGE_RECIPIENTS_FILE}" 2>/dev/null || echo 0)"
+    enc_desc="age (${n_recipients} recipient(s) from ${BACKUP_AGE_RECIPIENTS_FILE})"
+  fi
+
+  local dest="local only"
+  if [[ "${BACKUP_SKIP_UPLOAD}" != "1" ]]; then
+    dest="${BACKUP_STORAGE_PROVIDER}://${BACKUP_STORAGE_BUCKET}/${BACKUP_STORAGE_PREFIX%/}"
+  fi
+
+  {
+    printf 'DRY RUN — no data will be dumped, uploaded or deleted.\n'
+    printf '  backup name:        %s\n' "${BACKUP_NAME}"
+    printf '  timestamp:          %s\n' "${BACKUP_DATE_ISO}"
+    printf '  work dir:           %s\n' "${WORK_DIR}"
+    printf '  database dump:      %s\n' "${db_planned}"
+    printf '  contract snapshot:  %s\n' "${contracts_planned}"
+    printf '  encryption:         %s\n' "${enc_desc}"
+    printf '  upload:             %s\n' "${upload_planned}"
+    printf '  destination:        %s\n' "${dest}"
+    printf '  retention prune:    %s (retention days: %s)\n' "${prune_planned}" "${BACKUP_RETENTION_DAYS}"
+    printf '  credentials (redacted):\n'
+    printf '    DATABASE_URL:                          %s\n' "$(redact "${DATABASE_URL}")"
+    printf '    BACKUP_ENCRYPTION_KEY:                 %s\n' "$(redact "${BACKUP_ENCRYPTION_KEY}")"
+    printf '    BACKUP_STORAGE_ACCESS_KEY_ID:          %s\n' "$(redact "${BACKUP_STORAGE_ACCESS_KEY_ID}")"
+    printf '    BACKUP_STORAGE_SECRET_ACCESS_KEY:      %s\n' "$(redact "${BACKUP_STORAGE_SECRET_ACCESS_KEY}")"
+    printf '    BACKUP_STORAGE_SESSION_TOKEN:          %s\n' "$(redact "${BACKUP_STORAGE_SESSION_TOKEN}")"
+    printf '    BACKUP_STORAGE_SUPABASE_SERVICE_KEY:   %s\n' "$(redact "${BACKUP_STORAGE_SUPABASE_SERVICE_KEY}")"
+  } >&2
 }
 
 # ---------------------------------------------------------------------------
@@ -847,6 +1036,14 @@ main() {
   info "Starting backup ${BACKUP_NAME}"
 
   check_dependencies
+
+  if [[ "${BACKUP_DRY_RUN}" == "1" ]]; then
+    print_dry_run_plan
+    info "Dry run complete; no changes made"
+    # Prevent the EXIT trap from emitting failure metrics for a dry run.
+    START_TS=""
+    exit 0
+  fi
 
   mkdir -p "${WORK_DIR}"
   local staging_dir="${WORK_DIR}/staging"
@@ -888,25 +1085,70 @@ main() {
   local contracts_included="false"
   [[ "${BACKUP_SKIP_CONTRACTS}" != "1" ]] && contracts_included="true"
 
+  UPLOADED_SIZE_BYTES="${size_bytes}"
+  UPLOADED_CHECKSUM="${checksum}"
+  UPLOADED_OBJECT_KEY="${encrypted_key}"
+
   write_manifest "${ENCRYPTED_PATH}" "${checksum}" "${size_bytes}" \
     "${encrypted_key}" "${db_included}" "${contracts_included}" \
     "${db_checksum}" "${contracts_checksum}"
 
-  upload_artifact "${ENCRYPTED_PATH}" "${encrypted_key}"
+  # 6a. Upload encrypted archive + manifest. Track upload status separately
+  # from retention so a later prune failure does not mask a recoverable backup.
+  if [[ "${BACKUP_SKIP_UPLOAD}" == "1" ]]; then
+    UPLOAD_STATUS="skipped"
+    info "Skipping upload (BACKUP_SKIP_UPLOAD=1)"
+  else
+    local upload_rc=0
+    upload_artifact "${ENCRYPTED_PATH}" "${encrypted_key}" || upload_rc=$?
+    if [[ "${upload_rc}" -eq 0 ]]; then
+      local manifest_key
+      manifest_key="$(object_key_for "$(basename "${MANIFEST_PATH}")")"
+      upload_artifact "${MANIFEST_PATH}" "${manifest_key}" || upload_rc=$?
+    fi
+    if [[ "${upload_rc}" -eq 0 ]]; then
+      UPLOAD_STATUS="success"
+      info "Upload succeeded: ${encrypted_key}"
+    else
+      UPLOAD_STATUS="failed"
+      UPLOAD_ERROR="upload failed with exit code ${upload_rc}"
+      error "Upload failed (exit ${upload_rc}); no recoverable backup was published"
+    fi
+  fi
 
-  local manifest_key
-  manifest_key="$(object_key_for "$(basename "${MANIFEST_PATH}")")"
-  upload_artifact "${MANIFEST_PATH}" "${manifest_key}"
+  # 6b. Prune expired backups exceeding BACKUP_RETENTION_DAYS. A prune failure
+  # is reported separately and must not invalidate a successful upload.
+  local prune_rc=0
+  prune_old_backups || prune_rc=$?
+  if [[ "${prune_rc}" -ne 0 ]]; then
+    RETENTION_STATUS="failed"
+    RETENTION_ERROR="retention cleanup failed with exit code ${prune_rc}"
+    warn "Retention cleanup failed (exit ${prune_rc}); uploaded backup remains available"
+  elif [[ "${RETENTION_STATUS}" == "pending" ]]; then
+    RETENTION_STATUS="success"
+  fi
 
-  # 6b. Prune expired backups exceeding BACKUP_RETENTION_DAYS.
-  prune_old_backups
+  update_manifest_status
 
-  # 7. Metrics.
+  # 7. Metrics. Overall success requires a successful upload (or an explicit
+  # skip) and a non-failed retention phase.
   local end_ts duration
   end_ts="$(date -u +%s)"
   duration=$(( end_ts - start_ts ))
 
-  emit_metrics 1 "${duration}" "${size_bytes}" "${end_ts}" ""
+  local overall_success=1
+  if [[ "${UPLOAD_STATUS}" == "failed" || "${RETENTION_STATUS}" == "failed" ]]; then
+    overall_success=0
+  fi
+
+  local overall_error=""
+  if [[ "${UPLOAD_STATUS}" == "failed" ]]; then
+    overall_error="${UPLOAD_ERROR}"
+  elif [[ "${RETENTION_STATUS}" == "failed" ]]; then
+    overall_error="${RETENTION_ERROR}"
+  fi
+
+  emit_metrics "${overall_success}" "${duration}" "${size_bytes}" "${end_ts}" "${overall_error}"
 
   # 8. Optional local copy of the manifest (e.g. for CI artifact upload).
   if [[ -n "${BACKUP_OUTPUT_DIR}" ]]; then
@@ -916,15 +1158,26 @@ main() {
     info "Manifest copied to ${BACKUP_OUTPUT_DIR}"
   fi
 
+  if [[ "${UPLOAD_STATUS}" == "failed" ]]; then
+    die 1 "Backup upload failed; no recoverable backup was published"
+  fi
+
+  if [[ "${RETENTION_STATUS}" == "failed" ]]; then
+    warn "Backup uploaded successfully (${size_bytes} bytes, sha256=${checksum}) but retention cleanup failed"
+    die 1 "Retention cleanup failed after successful upload"
+  fi
+
   info "Backup completed successfully in ${duration}s (${size_bytes} bytes, sha256=${checksum})"
 }
 
 prune_old_backups() {
   if [[ "${BACKUP_SKIP_UPLOAD}" == "1" || "${BACKUP_SKIP_PRUNE}" == "1" ]]; then
     debug "Skipping backup pruning"
+    RETENTION_STATUS="skipped"
     return 0
   fi
   if [[ -z "${BACKUP_RETENTION_DAYS}" || "${BACKUP_RETENTION_DAYS}" -le 0 ]]; then
+    RETENTION_STATUS="skipped"
     return 0
   fi
 
@@ -934,6 +1187,7 @@ prune_old_backups() {
     || true)"
   if [[ -z "${cutoff_ts}" ]]; then
     warn "Could not compute retention cutoff timestamp; skipping prune"
+    RETENTION_STATUS="skipped"
     return 0
   fi
 

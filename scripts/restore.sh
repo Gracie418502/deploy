@@ -12,6 +12,9 @@
 #   --database-url <url>   Target Postgres connection string (default: $DATABASE_URL)
 #   --verify-only          Restore into a throwaway database, check every table
 #                          from the backup came back, then drop it
+#   --plan                 Inspect the backup and report its components, versions
+#                          and intended target without writing to any database
+#                          (no CREATE DATABASE, no restore, no post-restore SQL)
 #   --work-dir <dir>       Working directory for downloads (default: mktemp -d)
 #   --keep-work-dir        Do not delete the working directory on exit
 #   --post-restore-sql <f> Optional SQL script to run against Postgres after
@@ -65,7 +68,7 @@ die() {
 }
 
 usage() {
-  sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,51p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # Read a string field from the manifest written by backup.sh. The manifest has
@@ -104,7 +107,6 @@ verify_component_sum() {
   fi
   log "component checksum OK for $component ($actual)"
 }
-=======
 
 # Replace the database name in a postgres:// URL, keeping any query string.
 with_database() {
@@ -113,6 +115,18 @@ with_database() {
     printf '%s/%s%s' "${BASH_REMATCH[1]}" "$db" "${BASH_REMATCH[4]}"
   else
     die 1 "cannot parse database URL for --verify-only (expected postgres://...)"
+  fi
+}
+
+# Report the database name (and host) of a postgres:// URL without connecting.
+database_name_of() {
+  local url="$1"
+  if [[ "$url" =~ ^postgres(ql)?://([^/?]+)(/([^?]*))?(\?.*)?$ ]]; then
+    local host="${BASH_REMATCH[2]}" db="${BASH_REMATCH[4]}"
+    [[ -n "$db" ]] || db="(default)"
+    printf '%s on %s' "$db" "$host"
+  else
+    printf '(unparseable URL)'
   fi
 }
 
@@ -127,6 +141,7 @@ fi
 BACKUP_NAME=""
 DATABASE_URL_ARG=""
 VERIFY_ONLY="false"
+PLAN_ONLY="false"
 ASSUME_YES="false"
 WORK_DIR=""
 KEEP_WORK_DIR="false"
@@ -147,6 +162,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --verify-only)
       VERIFY_ONLY="true"
+      shift
+      ;;
+    --plan)
+      PLAN_ONLY="true"
       shift
       ;;
     -y|--yes)
@@ -181,6 +200,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$PLAN_ONLY" == "true" && "$VERIFY_ONLY" == "true" ]]; then
+  die 1 "--plan and --verify-only are mutually exclusive"
+fi
+
 # Accept either a bare name or a full object name with a known suffix.
 BACKUP_NAME="${BACKUP_NAME%.manifest.json}"
 BACKUP_NAME="${BACKUP_NAME%.tar.gz.enc}"
@@ -205,7 +228,11 @@ CONTRACT_STATE_FILE="${CONTRACT_STATE_FILE:-}"
 TARGET_DATABASE_URL="${DATABASE_URL_ARG:-${DATABASE_URL:-}}"
 
 [[ -n "$BUCKET" ]] || die 1 "BACKUP_STORAGE_BUCKET is not set"
-[[ -n "$TARGET_DATABASE_URL" ]] || die 1 "target database URL is not set (use --database-url or DATABASE_URL)"
+# In plan mode the target is only reported, never connected to, so a missing
+# target URL is not fatal there.
+if [[ "$PLAN_ONLY" != "true" ]]; then
+  [[ -n "$TARGET_DATABASE_URL" ]] || die 1 "target database URL is not set (use --database-url or DATABASE_URL)"
+fi
 
 for tool in psql gzip tar sha256sum python3; do
   command -v "$tool" >/dev/null 2>&1 || die 1 "required tool not found: $tool"
@@ -401,6 +428,80 @@ if [[ -d "$EXTRACT_DIR/contracts" ]]; then
   else
     log "WARNING: manifest has no checksum for contracts; skipping component verification"
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# Plan mode
+# ---------------------------------------------------------------------------
+# Report what a restore would do without writing to any database. Everything
+# below is read-only: no CREATE DATABASE, no psql restore, no post-restore SQL.
+print_plan() {
+  local schema_version created_at pg_version source_db
+  schema_version="$(manifest_field schema_version "$MANIFEST_PATH")"
+  created_at="$(manifest_field created_at "$MANIFEST_PATH")"
+  pg_version="$(manifest_field pg_version "$MANIFEST_PATH")"
+  source_db="$(manifest_field database "$MANIFEST_PATH")"
+
+  printf 'Restore plan\n' >&2
+  printf '============\n' >&2
+  printf 'Backup name:        %s\n' "$BACKUP_NAME" >&2
+  printf 'Storage:            %s://%s/%s\n' "$STORAGE_PROVIDER" "$BUCKET" "$PREFIX" >&2
+  printf 'Archive key:        %s\n' "$ARCHIVE_KEY" >&2
+  printf 'Manifest schema:    %s\n' "${schema_version:-unknown}" >&2
+  printf 'Created at:         %s\n' "${created_at:-unknown}" >&2
+  printf 'Postgres version:   %s\n' "${pg_version:-unknown}" >&2
+  printf 'Source database:    %s\n' "${source_db:-unknown}" >&2
+  printf 'Encryption method:  %s\n' "${ENCRYPTION_METHOD:-unknown}" >&2
+  printf 'Archive checksum:   %s (verified)\n' "$ACTUAL_SUM" >&2
+
+  printf '\nComponents:\n' >&2
+  local dump_sum contracts_sum
+  dump_sum="$(manifest_component_sum "database.sql.gz" "$MANIFEST_PATH")"
+  printf '  database.sql.gz   %s\n' "${dump_sum:+sha256:$dump_sum (verified)}${dump_sum:-no checksum recorded}" >&2
+  if [[ -d "$EXTRACT_DIR/contracts" ]]; then
+    contracts_sum="$(manifest_component_sum "contracts" "$MANIFEST_PATH")"
+    printf '  contracts/        %s\n' "${contracts_sum:+sha256:$contracts_sum (verified)}${contracts_sum:-no checksum recorded}" >&2
+  else
+    printf '  contracts/        not present in archive\n' >&2
+  fi
+  if [[ -f "$EXTRACT_DIR/tables.txt" ]]; then
+    local table_count
+    table_count="$(grep -c . "$EXTRACT_DIR/tables.txt" || true)"
+    printf '  tables.txt        %s table(s) recorded\n' "$table_count" >&2
+  else
+    printf '  tables.txt        not present in archive\n' >&2
+  fi
+
+  printf '\nIntended target:\n' >&2
+  if [[ -n "$TARGET_DATABASE_URL" ]]; then
+    printf '  %s\n' "$(database_name_of "$TARGET_DATABASE_URL")" >&2
+  else
+    printf '  (no target configured; pass --database-url or set DATABASE_URL)\n' >&2
+  fi
+
+  printf '\nPlanned actions:\n' >&2
+  if [[ "$VERIFY_ONLY" == "true" ]]; then
+    printf '  - create a throwaway verification database and restore into it\n' >&2
+    printf '  - compare restored tables against the backup table list\n' >&2
+    printf '  - drop the throwaway database\n' >&2
+  else
+    printf '  - restore over the target database (DROP ... IF EXISTS)\n' >&2
+    local sql_file="${POST_RESTORE_SQL_ARG:-${CONTRACT_STATE_FILE:-}}"
+    if [[ "$SKIP_CONTRACT_STATE" == "true" ]]; then
+      printf '  - skip post-restore SQL (--skip-contract-state)\n' >&2
+    elif [[ -n "$sql_file" ]]; then
+      printf '  - apply post-restore SQL from %s\n' "$sql_file" >&2
+    else
+      printf '  - no post-restore SQL configured\n' >&2
+    fi
+  fi
+
+  printf '\nPlan only: no database writes were performed.\n' >&2
+}
+
+if [[ "$PLAN_ONLY" == "true" ]]; then
+  print_plan
+  exit 0
 fi
 
 # ---------------------------------------------------------------------------
