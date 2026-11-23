@@ -132,6 +132,111 @@ test('deploy parseArgs understands --network, --wasm-dir, --yes, --dry-run', () 
   assert.throws(() => deploy.parseArgs(['--bogus']), /Unknown argument/);
 });
 
+test('deploy parseArgs accepts fee ceiling and timeout flags', () => {
+  const args = deploy.parseArgs([
+    '--max-fee',
+    '5000000',
+    '--max-tx-fee=1000000',
+    '--timeout',
+    '120',
+  ]);
+  assert.equal(args.maxFee, 5000000);
+  assert.equal(args.maxTxFee, 1000000);
+  assert.equal(args.timeout, 120);
+
+  // Invalid values are rejected.
+  assert.throws(() => deploy.parseArgs(['--max-fee', 'abc']), /--max-fee/);
+  assert.throws(() => deploy.parseArgs(['--max-fee', '-1']), /--max-fee/);
+  assert.throws(() => deploy.parseArgs(['--max-tx-fee', '0']), /--max-tx-fee/);
+  assert.throws(() => deploy.parseArgs(['--timeout', 'nope']), /--timeout/);
+  assert.throws(() => deploy.parseArgs(['--timeout', '0']), /--timeout/);
+});
+
+test('deploy submitTransaction aborts before signing when the fee exceeds the ceiling', async () => {
+  const kp = Keypair.random();
+  let signed = false;
+  let sent = false;
+
+  const mockServer = {
+    prepareTransaction: async () => ({
+      fee: '9000000', // 0.9 XLM, above the 0.5 XLM ceiling
+      sign: () => {
+        signed = true;
+      },
+    }),
+    sendTransaction: async () => {
+      sent = true;
+      return { status: 'PENDING', hash: 'should-not-send' };
+    },
+  };
+
+  await assert.rejects(
+    () =>
+      deploy.submitTransaction({
+        server: mockServer,
+        tx: {},
+        keypair: kp,
+        networkPassphrase: 'Test SDF Network ; September 2015',
+        dryRun: false,
+        label: 'fee-ceiling-tx',
+        maxTxFee: 5000000,
+      }),
+    /fee/i
+  );
+
+  assert.equal(signed, false);
+  assert.equal(sent, false);
+});
+
+test('deploy verifyNetworkIdentity rejects a mismatched RPC passphrase', async () => {
+  const server = {
+    getNetwork: async () => ({
+      passphrase: 'Public Global Stellar Network ; September 2015',
+      protocolVersion: 22,
+    }),
+  };
+
+  await assert.rejects(
+    () =>
+      deploy.verifyNetworkIdentity({
+        server,
+        networkPassphrase: 'Test SDF Network ; September 2015',
+        network: 'testnet',
+      }),
+    /network/i
+  );
+
+  // A matching passphrase resolves without throwing.
+  const okServer = {
+    getNetwork: async () => ({
+      passphrase: 'Test SDF Network ; September 2015',
+      protocolVersion: 22,
+    }),
+  };
+  await deploy.verifyNetworkIdentity({
+    server: okServer,
+    networkPassphrase: 'Test SDF Network ; September 2015',
+    network: 'testnet',
+  });
+});
+
+test('deploy pollTransaction surfaces the hash when the deadline elapses', async () => {
+  const server = {
+    getTransaction: async () => ({ status: 'NOT_FOUND' }),
+  };
+
+  await assert.rejects(
+    () =>
+      deploy.pollTransaction({
+        server,
+        hash: 'pendinghash456',
+        deadlineMs: 50,
+        intervalMs: 10,
+      }),
+    /pendinghash456/
+  );
+});
+
 test('deploy validateEnv resolves RPC, admin and wasm paths', () => {
   const kp = Keypair.random();
   const admin = Keypair.random().publicKey();
