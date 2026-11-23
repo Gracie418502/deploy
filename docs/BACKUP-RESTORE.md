@@ -85,6 +85,23 @@ Artifact names and storage prefixes are validated before any local or remote pat
 
 Names that fail validation are rejected with a clear error before any download, upload or local file is created. This applies to `--backup` values passed to `restore.sh` and to any configured storage prefix, so a crafted name cannot escape the `backups/` prefix in the bucket or the staging directory.
 
+Optional archive validation budgets for `restore.sh` (checked before any extraction):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `RESTORE_MAX_ARCHIVE_MEMBERS` | `10000` | Maximum number of members allowed in the decrypted tarball |
+| `RESTORE_MAX_UNCOMPRESSED_BYTES` | `10737418240` (10 GiB) | Maximum total uncompressed size of all archive members |
+
+### Archive validation hardening
+
+Before extracting anything, `restore.sh` inspects the decrypted tarball and rejects it (exit code 2) when:
+
+- **Member budget exceeded** — the archive contains more members than `RESTORE_MAX_ARCHIVE_MEMBERS`.
+- **Size budget exceeded** — the summed uncompressed size of all members exceeds `RESTORE_MAX_UNCOMPRESSED_BYTES`. This guards against decompression bombs that would exhaust disk during extraction.
+- **Duplicate member paths** — two members normalize to the same path (for example `./database.sql.gz`, `database.sql.gz` and `a/../database.sql.gz`). Duplicates are rejected because a later member could silently overwrite a previously extracted file.
+
+Raise the budgets only for legitimately larger backups (e.g. `RESTORE_MAX_UNCOMPRESSED_BYTES=$((20*1024*1024*1024)) ./scripts/restore.sh ...`); a rejected archive usually indicates corruption or tampering and should be investigated rather than bypassed.
+
 ### Network deadlines and retries
 
 Every RPC and object-storage call is bounded by a deadline (`timeout`/`--cli-read-timeout` for `aws`, `curl --max-time` for RPC) so a hung endpoint cannot stall a backup or restore indefinitely. Transient failures — timeouts, connection resets, HTTP 429/5xx, and S3 `RequestTimeout`/`SlowDown`/`InternalError` responses — are retried with exponential backoff up to `BACKUP_RETRY_MAX_ATTEMPTS` total attempts.
@@ -195,7 +212,7 @@ When hosting PostgreSQL on Supabase in production, enable **Supabase Point-in-Ti
    ```bash
    ./scripts/restore.sh --backup soroban-backup-<timestamp> --database-url "$DATABASE_URL"
    ```
-   The script downloads the manifest and archive, validates the manifest schema version and required fields, verifies the archive SHA-256, decrypts, then verifies each component checksum from `components` against the decrypted files before replaying the dump in a single transaction (a failed restore changes nothing). Objects in the target that are not in the backup are left in place. If the manifest's `postgres` versions are incompatible with the target server, the script warns (or aborts with `--verify-only`) before applying anything.
+   The script downloads the manifest and archive, validates the manifest schema version and required fields, verifies the archive SHA-256, decrypts, then validates the decrypted tarball before extraction: member count and total uncompressed size must stay within the configured budgets, and no two members may normalize to the same path (see section 2). Only after these checks pass does it extract, verify each component checksum from `components` against the decrypted files, and replay the dump in a single transaction (a failed restore changes nothing). Objects in the target that are not in the backup are left in place. If the manifest's `postgres` versions are incompatible with the target server, the script warns (or aborts with `--verify-only`) before applying anything.
 
 4. **Inspect contract state snapshots (if needed).** Add `--keep-work-dir` to keep the extracted `contracts/` snapshots. On-chain state cannot be "restored"; use the snapshots to confirm which contract IDs the application should point at, and use `scripts/rollback-contracts.cjs` to repoint it.
 
@@ -221,7 +238,7 @@ After restore, verify the following:
 
 ### 7.4 Rollback
 
-If the restore fails, `restore.sh` rolls its transaction back and exits non-zero (2 = download/manifest validation/checksum, 3 = decryption or component checksum mismatch, 4 = restore, 5 = verification). Fix the cause and re-run, or re-attempt with an earlier backup. If the failure is an unsupported manifest `schemaVersion`, use a `restore.sh` from the matching or newer release. Document the failure and notify the on-call engineer.
+If the restore fails, `restore.sh` rolls its transaction back and exits non-zero (2 = download/manifest validation/checksum or archive validation failure such as an exceeded member/size budget or duplicate member paths, 3 = decryption or component checksum mismatch, 4 = restore, 5 = verification). Fix the cause and re-run, or re-attempt with an earlier backup. If the failure is an unsupported manifest `schemaVersion`, use a `restore.sh` from the matching or newer release. Document the failure and notify the on-call engineer.
 
 ## 8. Testing
 

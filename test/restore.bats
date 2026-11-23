@@ -154,6 +154,78 @@ EOF
   [ "$status" -eq 0 ]
 }
 
+@test "validate_archive rejects an archive with too many members" {
+  local archive="$BATS_TEST_TMPDIR/many-members.tar.gz"
+  local workdir="$BATS_TEST_TMPDIR/many-members-src"
+  mkdir -p "$workdir"
+  local i
+  for i in $(seq 1 5); do
+    printf 'member %s\n' "$i" >"$workdir/file$i.txt"
+  done
+  tar -czf "$archive" -C "$workdir" .
+
+  run validate_archive "$archive" 3 1048576
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"member"* || "$output" == *"too many"* ]]
+}
+
+@test "validate_archive rejects an archive exceeding the uncompressed size budget" {
+  local archive="$BATS_TEST_TMPDIR/oversized.tar.gz"
+  local workdir="$BATS_TEST_TMPDIR/oversized-src"
+  mkdir -p "$workdir"
+  # Highly compressible payload: small on disk, large uncompressed.
+  head -c 1048576 /dev/zero | tr '\0' 'a' >"$workdir/big.txt"
+  tar -czf "$archive" -C "$workdir" .
+
+  run validate_archive "$archive" 100 1024
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"size"* || "$output" == *"budget"* || "$output" == *"too large"* ]]
+}
+
+@test "validate_archive accepts an archive within the configured budgets" {
+  local archive="$BATS_TEST_TMPDIR/within-budget.tar.gz"
+  local workdir="$BATS_TEST_TMPDIR/within-budget-src"
+  mkdir -p "$workdir"
+  printf 'small payload\n' >"$workdir/small.txt"
+  tar -czf "$archive" -C "$workdir" .
+
+  run validate_archive "$archive" 100 1048576
+  [ "$status" -eq 0 ]
+}
+
+@test "validate_archive rejects duplicate member paths" {
+  local archive="$BATS_TEST_TMPDIR/duplicate-members.tar.gz"
+  local workdir="$BATS_TEST_TMPDIR/duplicate-src"
+  mkdir -p "$workdir"
+  printf 'first\n' >"$workdir/dup.txt"
+  tar -czf "$archive" -C "$workdir" dup.txt
+  # Append the same member name a second time.
+  tar -czf "$BATS_TEST_TMPDIR/dup-extra.tar.gz" -C "$workdir" dup.txt
+  # Rebuild with the member listed twice by concatenating tar streams.
+  cat "$archive" "$BATS_TEST_TMPDIR/dup-extra.tar.gz" >"$BATS_TEST_TMPDIR/dup-combined.tar.gz"
+  # Use a plain (uncompressed) tar so duplicate entries can be appended.
+  tar -cf "$BATS_TEST_TMPDIR/dup.tar" -C "$workdir" dup.txt
+  tar -rf "$BATS_TEST_TMPDIR/dup.tar" -C "$workdir" dup.txt
+
+  run validate_archive "$BATS_TEST_TMPDIR/dup.tar" 100 1048576
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"duplicate"* || "$output" == *"repeated"* ]]
+}
+
+@test "validate_archive rejects equivalently-spelled duplicate member paths" {
+  local workdir="$BATS_TEST_TMPDIR/equiv-src"
+  mkdir -p "$workdir/sub"
+  printf 'payload\n' >"$workdir/sub/file.txt"
+  local archive="$BATS_TEST_TMPDIR/equiv.tar"
+  tar -cf "$archive" -C "$workdir" sub/file.txt
+  # Append an equivalent spelling of the same normalized path.
+  tar -rf "$archive" -C "$workdir" ./sub/file.txt
+
+  run validate_archive "$archive" 100 1048576
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"duplicate"* || "$output" == *"repeated"* ]]
+}
+
 @test "restore.sh --help exits 0" {
   run "$REPO_ROOT/scripts/restore.sh" --help
   [ "$status" -eq 0 ]
