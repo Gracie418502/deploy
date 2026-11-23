@@ -492,6 +492,15 @@ esac
 # duplicate normalized member names, and archives exceeding the configured
 # member-count / uncompressed-size budgets.
 python3 "$(dirname "${BASH_SOURCE[0]}")/validate-archive.py" "$ARCHIVE_PATH" \
+  || die 3 "archive contains unsafe paths or file types"
+
+# Check the archive's top-level components against the restore allowlist before
+# extracting or touching any database. Unknown required components, unexpected
+# executables, or unrelated files fail closed here (exit 3).
+log "validating archive contents against the restore component allowlist"
+python3 "$(dirname "${BASH_SOURCE[0]}")/validate-archive.py" --allowlist "$ARCHIVE_PATH" \
+  || die 3 "archive contents failed allowlist validation (unexpected or missing components)"
+
   --max-members "${RESTORE_MAX_MEMBERS:-10000}" \
   --max-uncompressed-bytes "${RESTORE_MAX_UNCOMPRESSED_BYTES:-10737418240}" \
   || die 3 "archive rejected: unsafe paths or file types, duplicate member paths, or exceeds size/member budget"

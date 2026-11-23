@@ -132,6 +132,26 @@ Each run writes two objects under `s3://<bucket>/backups/`:
   - `components` — per-component SHA-256 checksums recorded before encryption: `database.sql.gz`, `tables.txt` and each file under `contracts/`.
   - `postgres` — `serverVersion` (from `SHOW server_version`) and `pgDumpVersion` (from `pg_dump --version`).
 
+### Archive component allowlist
+
+`restore.sh` validates the archive's top-level contents against an allowlist before restoring anything. The archive must contain exactly these **required** top-level components:
+
+| Component | Kind | Purpose |
+| --- | --- | --- |
+| `database.sql.gz` | required file | Gzipped `pg_dump` output replayed into the target |
+| `tables.txt` | required file | Table list used for verification |
+| `contracts/` | required directory | Soroban contract state snapshots (may be empty when no contracts are configured) |
+| `manifest.json` | required file | Manifest copy embedded in the archive (must match the downloaded manifest) |
+
+The following **optional metadata** files are also allowed at the top level:
+
+| Component | Kind | Purpose |
+| --- | --- | --- |
+| `backup-info.txt` | optional file | Human-readable summary written by `backup.sh` (timestamp, versions, component list) |
+| `checksums.sha256` | optional file | Plain-text checksum listing for manual inspection |
+
+Any other top-level entry — an unknown file, an unexpected directory, or any member with the executable bit set — is treated as unexplained content. `restore.sh` fails closed: it aborts with a non-zero exit code (2) and a clear error listing the offending entries **before** decrypting or touching the target database. If a required component is missing, restore also aborts. To restore an archive that legitimately needs additional components, update the allowlist in `restore.sh` and this document in the same change; do not bypass the check.
+
 ### Manifest schema and compatibility policy
 
 The manifest declares a `schemaVersion`. `restore.sh` validates the manifest before touching the target database: required fields must be present and correctly typed, and the `schemaVersion` must be one it supports (currently `1`). Unsupported or newer schema versions are rejected with a clear error before any download or restore work begins, so an old `restore.sh` never misinterprets a newer manifest.
@@ -486,6 +506,7 @@ If the target is unreachable or the role lacks a required permission, the script
    ```bash
    ./scripts/restore.sh --backup soroban-backup-<timestamp> --database-url "$DATABASE_URL"
    ```
+   The script downloads the manifest and archive, validates the manifest schema version and required fields, verifies the archive SHA-256, decrypts, then checks the archive's top-level contents against the component allowlist (see section 2, "Archive component allowlist"): all required components (`database.sql.gz`, `tables.txt`, `contracts/`, `manifest.json`) must be present, only the documented optional metadata files may accompany them, and any other entry or executable member aborts the restore before anything is applied. It then verifies each component checksum from `components` against the decrypted files before replaying the dump in a single transaction (a failed restore changes nothing). Objects in the target that are not in the backup are left in place. If the manifest's `postgres` versions are incompatible with the target server, the script warns (or aborts with `--verify-only`) before applying anything.
    The script first runs the preflight checks described in section 7.1.1 (target connectivity, required permissions, and PostgreSQL version compatibility) and aborts early with a clear error if they fail — before downloading or decrypting anything, so no decrypted staging artifacts are created. Once preflight passes, it downloads the manifest and archive, validates the manifest schema version and required fields, verifies the archive SHA-256, decrypts, then verifies each component checksum from `components` against the decrypted files before replaying the dump in a single transaction (a failed restore changes nothing). Objects in the target that are not in the backup are left in place. If the manifest's `postgres` versions are incompatible with the target server, the script warns (or aborts with `--verify-only`) before applying anything. The work directory is cleaned up by a trap on every exit path unless `--keep-work-dir` is given.
    The script downloads the manifest and archive, validates the manifest schema version and required fields, verifies the archive SHA-256, decrypts, then validates the decrypted tarball before extraction: member count and total uncompressed size must stay within the configured budgets, and no two members may normalize to the same path (see section 2). Only after these checks pass does it extract, verify each component checksum from `components` against the decrypted files, and replay the dump in a single transaction (a failed restore changes nothing). Objects in the target that are not in the backup are left in place. If the manifest's `postgres` versions are incompatible with the target server, the script warns (or aborts with `--verify-only`) before applying anything.
 
@@ -513,6 +534,7 @@ After restore, verify the following:
 
 ### 7.4 Rollback
 
+If the restore fails, `restore.sh` rolls its transaction back and exits non-zero (2 = download/manifest validation/checksum/archive allowlist, 3 = decryption or component checksum mismatch, 4 = restore, 5 = verification). Fix the cause and re-run, or re-attempt with an earlier backup. If the failure is an unsupported manifest `schemaVersion`, use a `restore.sh` from the matching or newer release. If the failure is an archive allowlist violation (unexpected top-level entry, executable member, or missing required component), do not restore that archive: treat it as suspect, preserve it for investigation, and restore an earlier verified backup. Document the failure and notify the on-call engineer.
 If the restore fails, `restore.sh` rolls its transaction back and exits non-zero (2 = download/manifest validation/checksum, 3 = decryption or component checksum mismatch, 4 = restore, 5 = verification). Fix the cause and re-run, or re-attempt with an earlier backup. If the failure is an unsupported manifest `schemaVersion`, use a `restore.sh` from the matching or newer release. If preflight fails (unreachable target or missing permissions), fix connectivity or grant the required permissions and re-run; nothing was downloaded or decrypted, so there is no staging state to clean up. Document the failure and notify the on-call engineer.
 If the restore fails, `restore.sh` rolls its transaction back and exits non-zero (2 = download/manifest validation/checksum or archive validation failure such as an exceeded member/size budget or duplicate member paths, 3 = decryption or component checksum mismatch, 4 = restore, 5 = verification). Fix the cause and re-run, or re-attempt with an earlier backup. If the failure is an unsupported manifest `schemaVersion`, use a `restore.sh` from the matching or newer release. Document the failure and notify the on-call engineer.
 

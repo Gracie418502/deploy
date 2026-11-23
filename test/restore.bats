@@ -154,6 +154,50 @@ EOF
   [ "$status" -eq 0 ]
 }
 
+@test "validate_archive_contents accepts an archive with only allowed components" {
+  local workdir="$BATS_TEST_TMPDIR/allowlist-ok"
+  mkdir -p "$workdir"
+  printf 'database dump\n' >"$workdir/database.sql.gz"
+  printf 'contracts\n' >"$workdir/contracts.tar.gz"
+  printf '{"schemaVersion":1}\n' >"$workdir/manifest.json"
+
+  run validate_archive_contents "$workdir"
+  [ "$status" -eq 0 ]
+}
+
+@test "validate_archive_contents rejects an unexpected executable file" {
+  local workdir="$BATS_TEST_TMPDIR/allowlist-exec"
+  mkdir -p "$workdir"
+  printf 'database dump\n' >"$workdir/database.sql.gz"
+  printf 'contracts\n' >"$workdir/contracts.tar.gz"
+  printf '#!/bin/sh\necho pwned\n' >"$workdir/evil.sh"
+  chmod +x "$workdir/evil.sh"
+
+  run validate_archive_contents "$workdir"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"evil.sh"* ]]
+}
+
+@test "validate_archive_contents rejects an unrelated top-level file" {
+  local workdir="$BATS_TEST_TMPDIR/allowlist-unrelated"
+  mkdir -p "$workdir"
+  printf 'database dump\n' >"$workdir/database.sql.gz"
+  printf 'contracts\n' >"$workdir/contracts.tar.gz"
+  printf 'notes\n' >"$workdir/README.txt"
+
+  run validate_archive_contents "$workdir"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"README.txt"* ]]
+}
+
+@test "validate_archive_contents fails closed when a required component is missing" {
+  local workdir="$BATS_TEST_TMPDIR/allowlist-missing"
+  mkdir -p "$workdir"
+  printf 'contracts\n' >"$workdir/contracts.tar.gz"
+
+  run validate_archive_contents "$workdir"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"database.sql.gz"* ]]
 @test "preflight_database fails fast for an unreachable target without staging artifacts" {
   local workdir="$BATS_TEST_TMPDIR/preflight-unreachable"
   mkdir -p "$workdir"
