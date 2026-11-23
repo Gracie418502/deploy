@@ -105,6 +105,14 @@ BACKUP_RETRY_MAX_BACKOFF_SECONDS="${BACKUP_RETRY_MAX_BACKOFF_SECONDS:-30}"
 # Optional: path to a file containing additional contract IDs (one per line).
 SOROBAN_CONTRACT_IDS_FILE="${SOROBAN_CONTRACT_IDS_FILE:-}"
 
+# Comma-separated list of critical tables (schema.table or table) whose row
+# counts are recorded at backup time so restore.sh can verify them afterwards.
+# Example: BACKUP_CRITICAL_TABLES="public.accounts,public.orders"
+BACKUP_CRITICAL_TABLES="${BACKUP_CRITICAL_TABLES:-}"
+# Optional path to a file with one critical table per line (blank lines and
+# lines starting with '#' are ignored). Merged with BACKUP_CRITICAL_TABLES.
+BACKUP_CRITICAL_TABLES_FILE="${BACKUP_CRITICAL_TABLES_FILE:-}"
+
 # Retention / behaviour toggles.
 BACKUP_SKIP_DB="${BACKUP_SKIP_DB:-0}"
 BACKUP_SKIP_CONTRACTS="${BACKUP_SKIP_CONTRACTS:-0}"
@@ -116,6 +124,9 @@ BACKUP_OUTPUT_DIR="${BACKUP_OUTPUT_DIR:-}"
 
 # Set by main(); read by the EXIT trap to report failure metrics.
 START_TS=""
+
+# JSON array of critical-table row counts captured during the dump (manifest).
+CRITICAL_TABLE_COUNTS_JSON="[]"
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -442,6 +453,99 @@ dump_database() {
   fi
 
   debug "Database dump written to ${dump_path} ($(stat -c '%s' "${dump_path}" 2>/dev/null || stat -f '%z' "${dump_path}") bytes)"
+
+  # Record row counts for the configured critical tables so restore.sh can
+  # verify that no critical data went missing even when every table exists.
+  record_critical_table_counts "${out_dir}"
+}
+
+# Resolve the list of critical tables from env var and/or file.
+resolve_critical_tables() {
+  local tables=()
+
+  if [[ -n "${BACKUP_CRITICAL_TABLES}" ]]; then
+    IFS=',' read -r -a _env_tables <<< "${BACKUP_CRITICAL_TABLES}"
+    for t in "${_env_tables[@]}"; do
+      t="$(printf '%s' "${t}" | tr -d '[:space:]')"
+      [[ -n "${t}" ]] && tables+=("${t}")
+    done
+  fi
+
+  if [[ -n "${BACKUP_CRITICAL_TABLES_FILE}" && -f "${BACKUP_CRITICAL_TABLES_FILE}" ]]; then
+    while IFS= read -r line; do
+      line="$(printf '%s' "${line}" | tr -d '[:space:]')"
+      [[ -z "${line}" || "${line}" == \#* ]] && continue
+      tables+=("${line}")
+    done < "${BACKUP_CRITICAL_TABLES_FILE}"
+  fi
+
+  # De-duplicate while preserving order.
+  if [[ ${#tables[@]} -gt 0 ]]; then
+    printf '%s\n' "${tables[@]}" | awk '!seen[$0]++'
+  fi
+}
+
+# Quote an identifier for safe use in SQL (schema.table or table).
+sql_quote_ident() {
+  local ident="$1"
+  printf '"%s"' "${ident//\"/\"\"}"
+}
+
+# Write critical-tables.txt (TSV: table<TAB>row_count) into the staging dir and
+# populate CRITICAL_TABLE_COUNTS_JSON for the manifest.
+record_critical_table_counts() {
+  local out_dir="$1"
+  CRITICAL_TABLE_COUNTS_JSON="[]"
+
+  local tables
+  tables="$(resolve_critical_tables || true)"
+  if [[ -z "${tables}" ]]; then
+    debug "No critical tables configured; skipping row count capture"
+    return 0
+  fi
+
+  info "Recording row counts for critical tables"
+  local counts_file="${out_dir}/critical-tables.txt"
+  : > "${counts_file}"
+
+  local entries=()
+  local table count
+  while IFS= read -r table; do
+    [[ -z "${table}" ]] && continue
+
+    local qualified
+    if [[ "${table}" == *.* ]]; then
+      local schema="${table%%.*}"
+      local rel="${table#*.}"
+      qualified="$(sql_quote_ident "${schema}").$(sql_quote_ident "${rel}")"
+    else
+      qualified="$(sql_quote_ident "${table}")"
+    fi
+
+    count="$(psql "${DATABASE_URL}" -X -At -v ON_ERROR_STOP=1 \
+      -c "SELECT count(*) FROM ${qualified};" 2>/dev/null | head -n1 || true)"
+
+    if [[ -z "${count}" || ! "${count}" =~ ^[0-9]+$ ]]; then
+      warn "Could not record row count for critical table ${table}"
+      printf '%s\t%s\n' "${table}" "unknown" >> "${counts_file}"
+      entries+=("$(printf '{"table":"%s","rowCount":null}' "$(json_escape "${table}")")")
+      continue
+    fi
+
+    printf '%s\t%s\n' "${table}" "${count}" >> "${counts_file}"
+    entries+=("$(printf '{"table":"%s","rowCount":%s}' "$(json_escape "${table}")" "${count}")")
+    debug "Critical table ${table}: ${count} rows"
+  done <<< "${tables}"
+
+  local joined="" entry
+  for entry in "${entries[@]}"; do
+    if [[ -n "${joined}" ]]; then
+      joined="${joined},${entry}"
+    else
+      joined="${entry}"
+    fi
+  done
+  CRITICAL_TABLE_COUNTS_JSON="[${joined}]"
 }
 
 # ---------------------------------------------------------------------------
@@ -824,6 +928,7 @@ write_manifest() {
     "database": "$(json_escape "${db_checksum}")",
     "contracts": "$(json_escape "${contracts_checksum}")"
   },
+  "criticalTables": ${CRITICAL_TABLE_COUNTS_JSON:-[]},
   "artifacts": {
     "archive": "$(json_escape "${BACKUP_NAME}.tar.gz")",
     "encrypted": "$(json_escape "${enc_basename}")",
