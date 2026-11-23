@@ -6,5 +6,16 @@ metadata:
     app.kubernetes.io/name: synapsvault
     app.kubernetes.io/part-of: synapsvault
     environment: production
+    # Pod Security Admission: enforce the restricted profile for both
+    # enforcement and audit. The backend/frontend deployments and the
+    # migration job already run as non-root with privilege escalation
+    # disabled, all capabilities dropped, and the RuntimeDefault seccomp
+    # profile, so they comply with the restricted level.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
   annotations:
     description: SynapsVault production namespace

@@ -8,6 +8,7 @@ namespace: synapsvault
 # Create `backend-secret` out-of-band (see docs/DEPLOY-KUBERNETES.md).
 resources:
   - namespace.yaml
+  - limitrange.yaml
   - configmap.yaml
   - backend-serviceaccount.yaml
   - backend-migrate-job.yaml
@@ -53,6 +54,19 @@ images:
     newName: ghcr.io/synapsvault/deploy/frontend
     newTag: 0.0.0
 
+# Ingress-controller namespace used by the NetworkPolicies to allow traffic
+# from the ingress controller. Override per environment with
+#   kustomize edit set configmap ingress-controller-config \
+#     --from-literal=namespace=<your-controller-namespace>
+# or by patching the ConfigMap. The value is propagated to the
+# `ingress-controller-namespace` label on the synapsvault namespace, which the
+# NetworkPolicies select on. It must name a single namespace; an empty value
+# would broaden access, so keep it set.
+configMapGenerator:
+  - name: ingress-controller-config
+    literals:
+      - namespace=ingress-nginx
+
 replacements:
   - source:
       kind: ConfigMap
@@ -72,3 +86,16 @@ replacements:
         options:
           delimiter: /
           index: 2
+  # Propagate the configured ingress-controller namespace onto the
+  # synapsvault Namespace as a label so NetworkPolicies can select it without
+  # hardcoding `ingress-nginx`.
+  - source:
+      kind: ConfigMap
+      name: ingress-controller-config
+      fieldPath: data.namespace
+    targets:
+      - select:
+          kind: Namespace
+          name: synapsvault
+        fieldPaths:
+          - metadata.labels.ingress-controller-namespace
