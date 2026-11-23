@@ -8,6 +8,7 @@ namespace: synapsvault
 # Create `backend-secret` out-of-band (see docs/DEPLOY-KUBERNETES.md).
 resources:
   - namespace.yaml
+  - limitrange.yaml
   - configmap.yaml
   - backend-serviceaccount.yaml
   - backend-migrate-job.yaml
