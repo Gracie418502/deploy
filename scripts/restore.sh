@@ -378,6 +378,14 @@ esac
 
 python3 "$(dirname "${BASH_SOURCE[0]}")/validate-archive.py" "$ARCHIVE_PATH" \
   || die 3 "archive contains unsafe paths or file types"
+
+# Check the archive's top-level components against the restore allowlist before
+# extracting or touching any database. Unknown required components, unexpected
+# executables, or unrelated files fail closed here (exit 3).
+log "validating archive contents against the restore component allowlist"
+python3 "$(dirname "${BASH_SOURCE[0]}")/validate-archive.py" --allowlist "$ARCHIVE_PATH" \
+  || die 3 "archive contents failed allowlist validation (unexpected or missing components)"
+
 EXTRACT_DIR="$(mktemp -d "$WORK_DIR/extracted.XXXXXXXX")"
 tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR" || die 3 "archive is not a valid tar.gz"
 

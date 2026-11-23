@@ -25,15 +25,72 @@ REQUIRED_STRING_FIELDS = (
 
 REQUIRED_COMPONENTS = ('database', 'contracts')
 
+# Top-level entries a restore bundle may contain. Anything else is rejected so
+# unexplained executables or unrelated files cannot ride along with a restore.
+ALLOWED_TOP_LEVEL = frozenset({
+    'database.sql.gz',
+    'tables.txt',
+    'contracts',
+    'manifest.json',
+})
+
+# Optional metadata files that may appear at the top level but are not required.
+OPTIONAL_METADATA = frozenset({
+    'README',
+    'README.md',
+    'metadata.json',
+})
+
+# Top-level components that must be present for a bundle to be restorable.
+REQUIRED_TOP_LEVEL = frozenset({
+    'database.sql.gz',
+    'contracts',
+    'manifest.json',
+})
+
+
+def _top_level(name):
+    """Return the first path component of an archive member name."""
+    parts = PurePosixPath(name).parts
+    return parts[0] if parts else ''
+
+
+def validate_components(names):
+    """Validate the set of archive member names against the component allowlist.
+
+    Rejects unknown top-level entries and fails closed when a required
+    top-level component is missing.
+    """
+    present = set()
+    for name in names:
+        top = _top_level(name)
+        if not top:
+            raise ValueError(f'unsupported archive member: {name}')
+        if top not in ALLOWED_TOP_LEVEL and top not in OPTIONAL_METADATA:
+            raise ValueError(f'unexpected top-level archive entry: {top}')
+        present.add(top)
+
+    missing = sorted(REQUIRED_TOP_LEVEL - present)
+    if missing:
+        raise ValueError(
+            'archive missing required top-level component(s): ' + ', '.join(missing)
+        )
+    return present
+
 
 def validate(archive):
     with tarfile.open(archive, 'r:gz') as bundle:
+        names = []
         for member in bundle:
             path = PurePosixPath(member.name)
             if path.is_absolute() or '..' in path.parts:
                 raise ValueError(f'unsafe archive path: {member.name}')
             if not (member.isfile() or member.isdir()):
                 raise ValueError(f'unsupported archive member: {member.name}')
+            if member.mode & 0o111:
+                raise ValueError(f'executable archive member: {member.name}')
+            names.append(member.name)
+        validate_components(names)
 
 
 def _require(manifest, field):

@@ -142,6 +142,71 @@ for manifest in invalid:
   assert.equal(result.status, 0, result.error?.message || result.stderr);
 });
 
+test('archive validation enforces the component allowlist', () => {
+  const result = spawnSync(
+    'python3',
+    [
+      '-c',
+      `
+import importlib.util, io, tarfile, tempfile
+spec = importlib.util.spec_from_file_location('validator', 'scripts/validate-archive.py')
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+def build(members):
+    archive = tempfile.NamedTemporaryFile(suffix='.tar.gz')
+    with tarfile.open(fileobj=archive, mode='w:gz') as bundle:
+        for name, kind, mode, payload in members:
+            member = tarfile.TarInfo(name)
+            member.type = kind
+            member.mode = mode
+            data = payload or b''
+            member.size = len(data)
+            bundle.addfile(member, io.BytesIO(data))
+    archive.flush()
+    return archive
+
+def accepts(members):
+    archive = build(members)
+    try:
+        module.validate(archive.name)
+    finally:
+        archive.close()
+
+def rejects(members):
+    archive = build(members)
+    try:
+        try:
+            module.validate(archive.name)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('archive was accepted: %r' % ([m[0] for m in members],))
+    finally:
+        archive.close()
+
+allowed = [
+    ('database.sql.gz', tarfile.REGTYPE, 0o644, b'data'),
+    ('contracts.tar.gz', tarfile.REGTYPE, 0o644, b'data'),
+    ('manifest.json', tarfile.REGTYPE, 0o644, b'{}'),
+]
+accepts(allowed)
+accepts(allowed[:2])
+
+rejects(allowed + [('extra.sh', tarfile.REGTYPE, 0o644, b'#!/bin/sh\\n')])
+rejects(allowed + [('payload', tarfile.REGTYPE, 0o755, b'')])
+rejects(allowed + [('unrelated.txt', tarfile.REGTYPE, 0o644, b'')])
+rejects(allowed + [('nested/database.sql.gz', tarfile.REGTYPE, 0o644, b'data')])
+rejects([allowed[0], allowed[2]])
+rejects([allowed[1], allowed[2]])
+rejects([allowed[2]])
+`,
+    ],
+    { cwd: path.resolve(__dirname, '..'), encoding: 'utf8' }
+  );
+  assert.equal(result.status, 0, result.error?.message || result.stderr);
+});
+
 test('manifest validation rejects malformed component checksums', () => {
   const result = spawnSync(
     'python3',
