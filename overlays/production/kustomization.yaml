@@ -11,3 +11,10 @@ patches:
       - op: replace
         path: /metadata/name
         value: synapsvault-production
+  - target:
+      kind: NetworkPolicy
+      name: allow-ingress-controller
+    patch: |-
+      - op: replace
+        path: /spec/ingress/0/from/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name
+        value: ingress-nginx-production
