@@ -192,6 +192,32 @@ jobs:
       - name: Check Grafana dashboard JSON
         run: python3 -m json.tool monitoring/grafana-dashboard.json > /dev/null
 
+  monitoring-drill:
+    name: Synthetic alert delivery drill
+    runs-on: ubuntu-latest
+    # Manual or scheduled only: the drill posts synthetic alerts to a live
+    # Alertmanager and must never gate pull requests.
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install amtool
+        run: |
+          curl -sSfL "https://github.com/prometheus/alertmanager/releases/download/v${ALERTMANAGER_VERSION}/alertmanager-${ALERTMANAGER_VERSION}.linux-amd64.tar.gz" \
+            | tar -xz --strip-components=1 -C /usr/local/bin "alertmanager-${ALERTMANAGER_VERSION}.linux-amd64/amtool"
+      - name: Run synthetic alert drill
+        env:
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL }}
+          DRILL_EVIDENCE_DIR: ${{ runner.temp }}/monitoring-drill
+        run: bash scripts/monitoring-drill.sh
+      - name: Upload drill evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitoring-drill-evidence
+          path: ${{ runner.temp }}/monitoring-drill
+          if-no-files-found: warn
+          retention-days: 30
+
   compose:
     name: Validate docker-compose
     runs-on: ubuntu-latest

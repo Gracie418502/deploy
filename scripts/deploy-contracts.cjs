@@ -86,12 +86,27 @@ function contractEnvName(contractName) {
 // 10 XLM accommodates uploading 3 WASM contracts (each ~300-500KB).
 const MIN_BALANCE_STROOPS = 100_000_000n; // 10 XLM
 
+// Default fee ceilings (in stroops). 1 XLM = 10,000,000 stroops.
+const DEFAULT_MAX_FEE_STROOPS = 10_000_000n; // 1 XLM per transaction
+const DEFAULT_MAX_TOTAL_FEE_STROOPS = 100_000_000n; // 10 XLM across all transactions
+
+// Default overall deadline for a single transaction confirmation.
+const DEFAULT_CONFIRM_TIMEOUT_MS = 120_000; // 2 minutes
+
 // ---------------------------------------------------------------------------
 // CLI argument parsing
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
-  const args = { network: null, dryRun: false, yes: false, wasmDir: null };
+  const args = {
+    network: null,
+    dryRun: false,
+    yes: false,
+    wasmDir: null,
+    maxFee: null,
+    maxTotalFee: null,
+    confirmTimeoutMs: null,
+  };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -115,6 +130,30 @@ function parseArgs(argv) {
       args.network = value;
     } else if (arg.startsWith('--network=')) {
       args.network = arg.slice('--network='.length);
+    } else if (arg === '--max-fee') {
+      const value = argv[++i];
+      if (!value) {
+        throw new Error('--max-fee requires a value (in stroops)');
+      }
+      args.maxFee = value;
+    } else if (arg.startsWith('--max-fee=')) {
+      args.maxFee = arg.slice('--max-fee='.length);
+    } else if (arg === '--max-total-fee') {
+      const value = argv[++i];
+      if (!value) {
+        throw new Error('--max-total-fee requires a value (in stroops)');
+      }
+      args.maxTotalFee = value;
+    } else if (arg.startsWith('--max-total-fee=')) {
+      args.maxTotalFee = arg.slice('--max-total-fee='.length);
+    } else if (arg === '--confirm-timeout') {
+      const value = argv[++i];
+      if (!value) {
+        throw new Error('--confirm-timeout requires a value (in milliseconds)');
+      }
+      args.confirmTimeoutMs = value;
+    } else if (arg.startsWith('--confirm-timeout=')) {
+      args.confirmTimeoutMs = arg.slice('--confirm-timeout='.length);
     } else if (arg === '--help' || arg === '-h') {
       printUsage();
       process.exit(0);
@@ -142,6 +181,12 @@ Options:
                                          (defaults to $CONTRACTS_WASM_DIR, then ./target/wasm32-unknown-unknown/release).
   --yes, -y                              Skip the interactive mainnet confirmation (for CI).
   --dry-run                              Perform all checks without submitting transactions.
+  --max-fee <stroops>                    Maximum fee (in stroops) allowed for any single
+                                         transaction (defaults to $MAX_FEE, then 10000000).
+  --max-total-fee <stroops>              Maximum cumulative fee (in stroops) allowed across
+                                         all transactions (defaults to $MAX_TOTAL_FEE, then 100000000).
+  --confirm-timeout <ms>                 Overall deadline for each transaction confirmation
+                                         (defaults to $CONFIRM_TIMEOUT_MS, then 120000).
   --help, -h                             Show this help message.
 `);
 }
@@ -205,7 +250,54 @@ function validateEnv(args) {
   const wasmDir = path.resolve(args.wasmDir || process.env.CONTRACTS_WASM_DIR || DEFAULT_WASM_DIR);
   const contracts = CONTRACTS.map((c) => ({ ...c, wasm: path.join(wasmDir, c.wasmFile) }));
 
-  return { keypair, network, rpcUrl, adminAddress, contracts };
+  const maxFee = parseStroopLimit(
+    args.maxFee ?? process.env.MAX_FEE,
+    DEFAULT_MAX_FEE_STROOPS,
+    'MAX_FEE'
+  );
+  const maxTotalFee = parseStroopLimit(
+    args.maxTotalFee ?? process.env.MAX_TOTAL_FEE,
+    DEFAULT_MAX_TOTAL_FEE_STROOPS,
+    'MAX_TOTAL_FEE'
+  );
+  const confirmTimeoutMs = parsePositiveInt(
+    args.confirmTimeoutMs ?? process.env.CONFIRM_TIMEOUT_MS,
+    DEFAULT_CONFIRM_TIMEOUT_MS,
+    'CONFIRM_TIMEOUT_MS'
+  );
+
+  return {
+    keypair,
+    network,
+    rpcUrl,
+    adminAddress,
+    contracts,
+    maxFee,
+    maxTotalFee,
+    confirmTimeoutMs,
+  };
+}
+
+function parseStroopLimit(raw, fallback, name) {
+  if (raw === undefined || raw === null || raw === '') {
+    return fallback;
+  }
+  const value = String(raw).trim();
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`${name} must be a non-negative integer number of stroops, got: ${raw}`);
+  }
+  return BigInt(value);
+}
+
+function parsePositiveInt(raw, fallback, name) {
+  if (raw === undefined || raw === null || raw === '') {
+    return fallback;
+  }
+  const value = String(raw).trim();
+  if (!/^\d+$/.test(value) || Number(value) <= 0) {
+    throw new Error(`${name} must be a positive integer number of milliseconds, got: ${raw}`);
+  }
+  return Number(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +329,55 @@ function confirmMainnet(network, assumeYes) {
       }
     );
   });
+}
+
+// ---------------------------------------------------------------------------
+// Network identity verification
+// ---------------------------------------------------------------------------
+
+/**
+ * Compare the RPC-reported network identity with the selected network's
+ * passphrase. Fails fast (before any signing/submission) on mismatch.
+ */
+async function verifyNetworkIdentity({ server, network, networkPassphrase }) {
+  log.step('Verifying RPC network identity');
+
+  const expected = networkPassphrase || NETWORK_PASSPHRASES[network];
+  if (!expected) {
+    throw new Error(`No network passphrase configured for "${network}"`);
+  }
+
+  let reported = null;
+  if (typeof server.getNetwork === 'function') {
+    try {
+      const info = await server.getNetwork();
+      reported = info && (info.passphrase || info.networkPassphrase || null);
+    } catch (err) {
+      throw new Error(`Unable to query RPC network identity: ${err.message}`);
+    }
+  } else if (typeof server.getNetworkPassphrase === 'function') {
+    try {
+      reported = await server.getNetworkPassphrase();
+    } catch (err) {
+      throw new Error(`Unable to query RPC network identity: ${err.message}`);
+    }
+  }
+
+  if (!reported) {
+    throw new Error(
+      'RPC endpoint did not report a network passphrase; refusing to sign transactions against an unverified endpoint.'
+    );
+  }
+
+  if (reported !== expected) {
+    throw new Error(
+      `RPC network identity mismatch: endpoint reports "${reported}" but "${network}" expects "${expected}". ` +
+        'Refusing to sign or submit transactions against a mismatched endpoint.'
+    );
+  }
+
+  log.ok(`RPC network identity matches "${network}"`);
+  return reported;
 }
 
 // ---------------------------------------------------------------------------
@@ -305,13 +446,61 @@ async function preflightChecks({ server, keypair, network, contracts, dryRun }) 
 // Transaction helpers
 // ---------------------------------------------------------------------------
 
-async function submitTransaction({ server, tx, keypair, dryRun, label }) {
+/**
+ * Enforce the per-transaction and cumulative fee ceilings against the fee
+ * estimated by simulation (via prepareTransaction). Aborts before signing.
+ */
+function enforceFeeCeiling({ label, estimatedFee, maxFee, maxTotalFee, spentFee }) {
+  const fee = BigInt(estimatedFee);
+  const total = BigInt(spentFee) + fee;
+
+  if (maxFee !== null && maxFee !== undefined && fee > BigInt(maxFee)) {
+    throw new Error(
+      `Estimated fee for ${label} (${fee} stroops) exceeds the per-transaction ceiling ` +
+        `(--max-fee / MAX_FEE = ${maxFee} stroops). Aborting before signing.`
+    );
+  }
+
+  if (maxTotalFee !== null && maxTotalFee !== undefined && total > BigInt(maxTotalFee)) {
+    throw new Error(
+      `Estimated cumulative fee after ${label} (${total} stroops) exceeds the total ceiling ` +
+        `(--max-total-fee / MAX_TOTAL_FEE = ${maxTotalFee} stroops). Aborting before signing.`
+    );
+  }
+
+  return total;
+}
+
+async function submitTransaction({
+  server,
+  tx,
+  keypair,
+  dryRun,
+  label,
+  maxFee,
+  maxTotalFee,
+  feeTracker,
+  confirmTimeoutMs,
+}) {
   if (dryRun) {
     log.info(`[dry-run] Skipping submission: ${label}`);
     return null;
   }
 
   const prepared = await server.prepareTransaction(tx);
+
+  // Estimate the fee from the simulated/prepared transaction before signing.
+  const estimatedFee = BigInt(prepared.fee);
+  const spentFee = feeTracker ? feeTracker.spent : 0n;
+  const newTotal = enforceFeeCeiling({
+    label,
+    estimatedFee,
+    maxFee,
+    maxTotalFee,
+    spentFee,
+  });
+  log.info(`Estimated fee for ${label}: ${estimatedFee} stroops`);
+
   prepared.sign(keypair);
 
   const sendResponse = await server.sendTransaction(prepared);
@@ -322,9 +511,12 @@ async function submitTransaction({ server, tx, keypair, dryRun, label }) {
   }
 
   const hash = sendResponse.hash;
+  if (feeTracker) {
+    feeTracker.spent = newTotal;
+  }
   log.info(`Submitted ${label} (hash: ${hash}); awaiting confirmation...`);
 
-  const result = await pollTransaction(server, hash);
+  const result = await pollTransaction(server, hash, { timeoutMs: confirmTimeoutMs });
   if (result.status !== 'SUCCESS') {
     throw new Error(`Transaction ${hash} for ${label} did not succeed: ${result.status}`);
   }
@@ -333,22 +525,56 @@ async function submitTransaction({ server, tx, keypair, dryRun, label }) {
   return result;
 }
 
-async function pollTransaction(server, hash, { attempts = 30, intervalMs = 2000 } = {}) {
-  for (let i = 0; i < attempts; i++) {
+/**
+ * Poll for a transaction result until it is no longer NOT_FOUND or the overall
+ * deadline elapses. On timeout the error includes the hash and last status so
+ * operators can reconcile the transaction later.
+ */
+async function pollTransaction(
+  server,
+  hash,
+  { timeoutMs = DEFAULT_CONFIRM_TIMEOUT_MS, intervalMs = 2000 } = {}
+) {
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus = 'NOT_FOUND';
+
+  while (true) {
     const response = await server.getTransaction(hash);
+    lastStatus = response.status;
     if (response.status !== 'NOT_FOUND') {
       return response;
     }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, remaining)));
   }
-  throw new Error(`Timed out waiting for transaction ${hash}`);
+
+  throw new Error(
+    `Timed out after ${timeoutMs}ms waiting for transaction ${hash} ` +
+      `(last observed status: ${lastStatus}). ` +
+      'The transaction may still be pending; reconcile using this hash before retrying.'
+  );
 }
 
 // ---------------------------------------------------------------------------
 // WASM upload
 // ---------------------------------------------------------------------------
 
-async function uploadWasm({ server, keypair, networkPassphrase, wasmPath, dryRun, contractName }) {
+async function uploadWasm({
+  server,
+  keypair,
+  networkPassphrase,
+  wasmPath,
+  dryRun,
+  contractName,
+  maxFee,
+  maxTotalFee,
+  feeTracker,
+  confirmTimeoutMs,
+}) {
   log.step(`Uploading WASM for "${contractName}"`);
 
   const wasm = fs.readFileSync(wasmPath);
@@ -378,6 +604,10 @@ async function uploadWasm({ server, keypair, networkPassphrase, wasmPath, dryRun
     networkPassphrase,
     dryRun,
     label: `upload WASM for "${contractName}"`,
+    maxFee,
+    maxTotalFee,
+    feeTracker,
+    confirmTimeoutMs,
   });
 
   const wasmHash = result.returnValue
@@ -403,6 +633,10 @@ async function deployContract({
   wasmHash,
   dryRun,
   contractName,
+  maxFee,
+  maxTotalFee,
+  feeTracker,
+  confirmTimeoutMs,
 }) {
   log.step(`Deploying contract "${contractName}"`);
 
@@ -432,6 +666,10 @@ async function deployContract({
     networkPassphrase,
     dryRun,
     label: `deploy "${contractName}"`,
+    maxFee,
+    maxTotalFee,
+    feeTracker,
+    confirmTimeoutMs,
   });
 
   const contractId = scValToNative(result.returnValue);
@@ -455,6 +693,10 @@ async function initContract({
   adminAddress,
   dryRun,
   contractName,
+  maxFee,
+  maxTotalFee,
+  feeTracker,
+  confirmTimeoutMs,
 }) {
   log.step(`Initializing contract "${contractName}"`);
 
@@ -481,6 +723,10 @@ async function initContract({
     networkPassphrase,
     dryRun,
     label: `init "${contractName}"`,
+    maxFee,
+    maxTotalFee,
+    feeTracker,
+    confirmTimeoutMs,
   });
 
   log.ok(`Initialized "${contractName}" with admin ${adminAddress}`);
@@ -623,7 +869,16 @@ function writeDeploymentRecord(contractIds, network, adminAddress, deployer, txH
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
-  const { keypair, network, rpcUrl, adminAddress, contracts } = validateEnv(args);
+  const {
+    keypair,
+    network,
+    rpcUrl,
+    adminAddress,
+    contracts,
+    maxFee,
+    maxTotalFee,
+    confirmTimeoutMs,
+  } = validateEnv(args);
   const networkPassphrase = NETWORK_PASSPHRASES[network];
 
   log.info(`Target network: ${network}`);
@@ -640,7 +895,15 @@ async function main() {
 
   const server = new rpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith('http://') });
 
+  await verifyNetworkIdentity({ server, network, networkPassphrase });
+
   await preflightChecks({ server, keypair, network, contracts, dryRun: args.dryRun });
+
+  log.info(`Per-transaction fee ceiling: ${maxFee} stroops`);
+  log.info(`Total fee ceiling: ${maxTotalFee} stroops`);
+  log.info(`Confirmation deadline: ${confirmTimeoutMs}ms`);
+
+  const feeTracker = { spent: 0n };
 
   log.info(`Admin address for init(): ${adminAddress}`);
 
@@ -668,6 +931,10 @@ async function main() {
       wasmPath: contract.wasm,
       dryRun: args.dryRun,
       contractName: contract.name,
+      maxFee,
+      maxTotalFee,
+      feeTracker,
+      confirmTimeoutMs,
     });
 
     const contractId = await deployContract({
@@ -677,6 +944,10 @@ async function main() {
       wasmHash,
       dryRun: args.dryRun,
       contractName: contract.name,
+      maxFee,
+      maxTotalFee,
+      feeTracker,
+      confirmTimeoutMs,
     });
 
     await initContract({
@@ -687,6 +958,10 @@ async function main() {
       adminAddress,
       dryRun: args.dryRun,
       contractName: contract.name,
+      maxFee,
+      maxTotalFee,
+      feeTracker,
+      confirmTimeoutMs,
     });
 
     await verifyContract({
@@ -724,7 +999,9 @@ module.exports = {
   validateEnv,
   CONTRACTS,
   contractEnvName,
+  verifyNetworkIdentity,
   preflightChecks,
+  enforceFeeCeiling,
   submitTransaction,
   pollTransaction,
   uploadWasm,
@@ -734,4 +1011,7 @@ module.exports = {
   loadExistingContractIds,
   writeContractIds,
   writeDeploymentRecord,
+  DEFAULT_MAX_FEE_STROOPS,
+  DEFAULT_MAX_TOTAL_FEE_STROOPS,
+  DEFAULT_CONFIRM_TIMEOUT_MS,
 };

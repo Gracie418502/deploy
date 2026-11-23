@@ -16,6 +16,21 @@ on:
         required: false
         default: false
         type: boolean
+      max_fee:
+        description: 'Per-transaction fee ceiling in stroops (blank = no ceiling)'
+        required: false
+        default: ''
+        type: string
+      max_total_fee:
+        description: 'Total fee ceiling across all transactions in stroops (blank = no ceiling)'
+        required: false
+        default: ''
+        type: string
+      confirm_timeout_ms:
+        description: 'Overall deadline for transaction confirmation polling, in milliseconds'
+        required: false
+        default: '300000'
+        type: string
 
 permissions:
   contents: write
@@ -68,7 +83,19 @@ jobs:
           NETWORK: ${{ inputs.network }}
           SOROBAN_RPC_URL: ${{ vars.SOROBAN_RPC_URL }}
           ADMIN_PUBLIC_KEY: ${{ vars.ADMIN_PUBLIC_KEY }}
-        run: node scripts/deploy-contracts.cjs --wasm-dir src/contracts/target/wasm32-unknown-unknown/release --yes
+          MAX_FEE: ${{ inputs.max_fee }}
+          MAX_TOTAL_FEE: ${{ inputs.max_total_fee }}
+          CONFIRM_TIMEOUT_MS: ${{ inputs.confirm_timeout_ms }}
+        run: |
+          set -euo pipefail
+          # The deploy script verifies the RPC-reported network identity against
+          # NETWORK before signing, aborts if a simulated fee exceeds MAX_FEE or
+          # MAX_TOTAL_FEE, and bounds confirmation polling by CONFIRM_TIMEOUT_MS.
+          # On timeout it prints the pending transaction hash so the run can be
+          # reconciled manually; the non-zero exit fails this job.
+          node scripts/deploy-contracts.cjs \
+            --wasm-dir src/contracts/target/wasm32-unknown-unknown/release \
+            --yes
 
       - name: Collect contract IDs
         id: ids
