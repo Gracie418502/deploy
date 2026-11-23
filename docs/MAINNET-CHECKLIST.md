@@ -8,6 +8,7 @@ This checklist must be completed and signed off before deploying to mainnet. Tes
 - [ ] Configure at least two independent RPC providers for redundancy and failover.
 - [ ] Set `RPC_URL` / provider config to the mainnet endpoints in the production environment only.
 - [ ] Verify chain ID and network parameters match mainnet exactly.
+- [ ] Confirm `STELLAR_NETWORK` is set to a supported value (`mainnet`) — `scripts/check-env.js` rejects unsupported network values.
 - [ ] Confirm rate limits and quotas on the dedicated RPC plan are sufficient for expected traffic.
 - [ ] Test failover behavior when the primary RPC is unavailable.
 - [ ] Restrict RPC credentials to the production deployment environment (no secrets in the repo).
@@ -20,6 +21,8 @@ This checklist must be completed and signed off before deploying to mainnet. Tes
 - [ ] A key rotation and recovery procedure is documented and rehearsed.
 - [ ] Backup/recovery material is stored securely and offline, with access controls.
 - [ ] No private keys, mnemonics, or seed phrases exist in the repository, CI logs, or chat history.
+- [ ] Run `scripts/check-env.js` against the production environment: declared account, signing key, and contract ID fields must pass SDK StrKey checksum validation (invalid checksums are rejected, and signing key values stay redacted in all diagnostics).
+- [ ] Confirm `STELLAR_PUBLIC_KEY` matches the public key derived from `STELLAR_SECRET_KEY` — `scripts/check-env.js` fails on a mismatch without printing either key or derived sensitive material.
 
 ## 3. Contract Audits
 
@@ -37,13 +40,29 @@ This checklist must be completed and signed off before deploying to mainnet. Tes
 - [ ] Emergency pause/upgrade procedures are documented and tested.
 - [ ] Admin actions emit events suitable for monitoring and post-hoc review.
 
-## 5. Monitoring & Sign-off
+## 5. Strict Mainnet Environment Validation
+
+- [ ] Run the environment checker in strict mainnet mode against the production target before sign-off:
+
+  ```sh
+  node scripts/check-env.js --target <target> --strict
+  # or, equivalently:
+  node scripts/check-env.js --target <target> --mainnet
+  ```
+
+- [ ] Strict mode rejects testnet network identifiers (e.g. testnet chain IDs/network names) — the target must be configured for mainnet.
+- [ ] Strict mode rejects insecure remote endpoints: any remote `http://` RPC/provider URL is refused; remote endpoints must use `https://` (local `http://` endpoints such as `localhost`/`127.0.0.1` remain allowed for local validation).
+- [ ] The strict validation result is recorded as part of the pre-mainnet sign-off below.
+- [ ] Normal (non-strict) local validation remains usable for development and testnet workflows.
+
+## 6. Monitoring & Sign-off
 
 - [ ] On-chain monitoring and alerting are configured for critical contracts and admin actions.
 - [ ] Dashboards cover transaction success rate, gas usage, and balance thresholds.
 - [ ] Alert routing (on-call, escalation) is confirmed with the responsible team.
 - [ ] Logging and error reporting are enabled for the production deployment.
 - [ ] A rollback/incident response plan is documented.
+- [ ] `scripts/check-env.js` passes cleanly against the production environment (supported `STELLAR_NETWORK`, valid StrKey checksums, matching public/secret key pair).
 - [ ] Final go/no-go sign-off is recorded from engineering, security, and operations owners.
 
 ## Sign-off
@@ -54,4 +73,5 @@ This checklist must be completed and signed off before deploying to mainnet. Tes
 | Key custody | | | |
 | Contract audits | | | |
 | Admin key handling | | | |
+| Strict env validation | | | |
 | Monitoring | | | |

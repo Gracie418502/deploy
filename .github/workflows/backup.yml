@@ -112,6 +112,15 @@ jobs:
           BACKUP_STORAGE_TIMEOUT_SECONDS: ${{ vars.BACKUP_STORAGE_TIMEOUT_SECONDS || '60' }}
           BACKUP_STORAGE_MAX_RETRIES: ${{ vars.BACKUP_STORAGE_MAX_RETRIES || '3' }}
           BACKUP_OUTPUT_DIR: backups
+          # Preflight staging-space budget (issue #204). The script fails early
+          # with a clear failure metric if less than this is free before the
+          # database dump is created. Override via the BACKUP_REQUIRED_FREE_BYTES
+          # repository variable.
+          BACKUP_REQUIRED_FREE_BYTES: ${{ vars.BACKUP_REQUIRED_FREE_BYTES || '5368709120' }}
+          # Unique run identifier (issue #203). Combined with an execution lock
+          # inside the script, concurrent or retried runs cannot overwrite each
+          # other's archive, manifest or metrics staging files.
+          BACKUP_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
           GIT_COMMIT: ${{ github.sha }}
           ENVIRONMENT: production
         run: bash scripts/backup.sh
@@ -148,10 +157,14 @@ jobs:
         if: always() && steps.config.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: backup-manifest-${{ github.run_id }}
+          # Include the run attempt so retried runs get a distinct artifact
+          # name instead of colliding with the previous attempt (issue #203).
+          name: backup-manifest-${{ github.run_id }}-${{ github.run_attempt }}
+          # The script stages outputs under a per-run subdirectory keyed by
+          # BACKUP_RUN_ID; glob recursively so the unique run path is matched.
           path: |
-            backups/*.json
-            backups/*.prom
+            backups/**/*.json
+            backups/**/*.prom
           if-no-files-found: warn
           retention-days: 30
 

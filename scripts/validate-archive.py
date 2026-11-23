@@ -2,6 +2,7 @@
 """Reject archive members that could escape the restore directory and
 validate backup manifests before a restore is attempted."""
 import json
+import os
 import re
 import sys
 import tarfile
@@ -10,6 +11,14 @@ from pathlib import PurePosixPath
 # Manifest schema versions this validator understands. Restores must reject
 # anything outside this set before touching the database.
 SUPPORTED_SCHEMA_VERSIONS = (1,)
+
+# Default budgets for archive expansion. These bound the work a restore can
+# trigger before any member is extracted.
+DEFAULT_MAX_MEMBERS = 10000
+DEFAULT_MAX_UNCOMPRESSED_BYTES = 10 * 1024 * 1024 * 1024  # 10 GiB
+
+ENV_MAX_MEMBERS = 'RESTORE_MAX_MEMBERS'
+ENV_MAX_UNCOMPRESSED_BYTES = 'RESTORE_MAX_UNCOMPRESSED_BYTES'
 
 SHA256_HEX = re.compile(r'^[0-9a-f]{64}$')
 
@@ -46,7 +55,50 @@ def _check_member(member):
         raise ValueError(f'unsupported archive member: {member.name}')
 
 
-def validate(archive):
+def normalize_member_name(name):
+    """Return a canonical member path for duplicate detection.
+
+    Strips leading './', collapses redundant slashes and resolves '.' segments
+    so that equivalent spellings map to the same normalized name.
+    """
+    parts = []
+    for part in name.split('/'):
+        if part in ('', '.'):
+            continue
+        parts.append(part)
+    return '/'.join(parts)
+
+
+def _resolve_budget(explicit, env_name, default, label):
+    if explicit is not None:
+        value = explicit
+    elif os.environ.get(env_name):
+        raw = os.environ[env_name]
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f'{env_name} must be an integer, got: {raw!r}')
+    else:
+        value = default
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f'{label} must be a non-negative integer')
+    return value
+
+
+def validate(archive, max_members=None, max_uncompressed_bytes=None):
+    max_members = _resolve_budget(
+        max_members, ENV_MAX_MEMBERS, DEFAULT_MAX_MEMBERS, 'max_members'
+    )
+    max_uncompressed_bytes = _resolve_budget(
+        max_uncompressed_bytes,
+        ENV_MAX_UNCOMPRESSED_BYTES,
+        DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        'max_uncompressed_bytes',
+    )
+
+    seen = set()
+    member_count = 0
+    total_size = 0
     with tarfile.open(archive, 'r:gz') as bundle:
         for member in bundle:
             _check_member(member)
@@ -68,6 +120,23 @@ def inspect_archive(archive):
             elif name.startswith('contracts/'):
                 present['contracts/'] = True
     return present
+
+            normalized = normalize_member_name(member.name)
+            if normalized in seen:
+                raise ValueError(f'duplicate archive member: {member.name}')
+            seen.add(normalized)
+
+            member_count += 1
+            if member_count > max_members:
+                raise ValueError(
+                    f'archive exceeds member budget of {max_members}'
+                )
+            total_size += member.size
+            if total_size > max_uncompressed_bytes:
+                raise ValueError(
+                    'archive exceeds uncompressed size budget of '
+                    f'{max_uncompressed_bytes} bytes'
+                )
 
 
 def _require(manifest, field):
@@ -150,12 +219,66 @@ def validate_manifest_file(path):
     return validate_manifest(manifest)
 
 
+def _parse_args(argv):
+    """Parse positional archive/manifest plus optional budget flags."""
+    max_members = None
+    max_uncompressed_bytes = None
+    positional = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == '--max-members':
+            index += 1
+            if index >= len(argv):
+                raise ValueError('--max-members requires a value')
+            max_members = argv[index]
+        elif arg.startswith('--max-members='):
+            max_members = arg.split('=', 1)[1]
+        elif arg == '--max-uncompressed-bytes':
+            index += 1
+            if index >= len(argv):
+                raise ValueError('--max-uncompressed-bytes requires a value')
+            max_uncompressed_bytes = argv[index]
+        elif arg.startswith('--max-uncompressed-bytes='):
+            max_uncompressed_bytes = arg.split('=', 1)[1]
+        else:
+            positional.append(arg)
+        index += 1
+
+    if not positional:
+        raise ValueError(
+            'usage: validate-archive.py [--max-members N] '
+            '[--max-uncompressed-bytes N] <archive> [manifest]'
+        )
+    if len(positional) > 2:
+        raise ValueError(
+            'usage: validate-archive.py [--max-members N] '
+            '[--max-uncompressed-bytes N] <archive> [manifest]'
+        )
+
+    def _to_int(value, label):
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            raise ValueError(f'{label} must be an integer, got: {value!r}')
+
+    return (
+        positional[0],
+        positional[1] if len(positional) > 1 else None,
+        _to_int(max_members, '--max-members'),
+        _to_int(max_uncompressed_bytes, '--max-uncompressed-bytes'),
+    )
+
+
 if __name__ == '__main__':
     try:
-        if len(sys.argv) < 2:
-            raise ValueError('usage: validate-archive.py <archive> [manifest]')
-        validate(sys.argv[1])
-        if len(sys.argv) > 2:
-            validate_manifest_file(sys.argv[2])
+        archive, manifest, max_members, max_uncompressed_bytes = _parse_args(
+            sys.argv[1:]
+        )
+        validate(archive, max_members, max_uncompressed_bytes)
+        if manifest is not None:
+            validate_manifest_file(manifest)
     except (OSError, ValueError, tarfile.TarError) as error:
         sys.exit(str(error))
