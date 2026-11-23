@@ -37,7 +37,22 @@ This checklist must be completed and signed off before deploying to mainnet. Tes
 - [ ] Emergency pause/upgrade procedures are documented and tested.
 - [ ] Admin actions emit events suitable for monitoring and post-hoc review.
 
-## 5. Monitoring & Sign-off
+## 5. Strict Mainnet Environment Validation
+
+- [ ] Run the environment checker in strict mainnet mode against the production target before sign-off:
+
+  ```sh
+  node scripts/check-env.js --target <target> --strict
+  # or, equivalently:
+  node scripts/check-env.js --target <target> --mainnet
+  ```
+
+- [ ] Strict mode rejects testnet network identifiers (e.g. testnet chain IDs/network names) — the target must be configured for mainnet.
+- [ ] Strict mode rejects insecure remote endpoints: any remote `http://` RPC/provider URL is refused; remote endpoints must use `https://` (local `http://` endpoints such as `localhost`/`127.0.0.1` remain allowed for local validation).
+- [ ] The strict validation result is recorded as part of the pre-mainnet sign-off below.
+- [ ] Normal (non-strict) local validation remains usable for development and testnet workflows.
+
+## 6. Monitoring & Sign-off
 
 - [ ] On-chain monitoring and alerting are configured for critical contracts and admin actions.
 - [ ] Dashboards cover transaction success rate, gas usage, and balance thresholds.
@@ -54,4 +69,5 @@ This checklist must be completed and signed off before deploying to mainnet. Tes
 | Key custody | | | |
 | Contract audits | | | |
 | Admin key handling | | | |
+| Strict env validation | | | |
 | Monitoring | | | |

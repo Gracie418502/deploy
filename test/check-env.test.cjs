@@ -60,6 +60,135 @@ test('parseArgs accepts equals syntax and rejects unknown or valueless options',
   }
 });
 
+test('parseEnvFile reports duplicate assignments with line numbers and applies last-wins', async () => {
+  const { parseEnvFile } = await checkEnv;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'check-env-test-'));
+  const file = path.join(dir, '.env');
+  fs.writeFileSync(
+    file,
+    '# header\n' +
+      'export DUP=first\n' +
+      'OTHER=value\n' +
+      'export DUP=second\n' +
+      'DUP=third\n'
+  );
+
+  try {
+    const result = parseEnvFile(file, { withDuplicates: true });
+    assert.equal(result.values.DUP, 'third');
+    assert.equal(result.values.OTHER, 'value');
+    assert.deepEqual(result.duplicates, [
+      { key: 'DUP', lines: [2, 4, 5] },
+    ]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('validateEnv keeps process.env precedence over env file values', async () => {
+  const { validateEnv } = await checkEnv;
+  const previous = process.env.CHECK_ENV_PRECEDENCE;
+  process.env.CHECK_ENV_PRECEDENCE = 'from-process';
+  try {
+    const spec = [{ name: 'CHECK_ENV_PRECEDENCE', description: 'Precedence probe' }];
+    const result = validateEnv(spec, { CHECK_ENV_PRECEDENCE: 'from-file' }, 'compose');
+    assert.equal(result.ok, true);
+    assert.equal(result.values.CHECK_ENV_PRECEDENCE, 'from-process');
+  } finally {
+    if (previous === undefined) delete process.env.CHECK_ENV_PRECEDENCE;
+    else process.env.CHECK_ENV_PRECEDENCE = previous;
+  }
+});
+
+test('run --json emits valid JSON with target, error codes and variable names only', async () => {
+  const { run } = await checkEnv;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'check-env-test-'));
+  const file = path.join(dir, '.env');
+  fs.writeFileSync(file, 'SUPABASE_URL=not a URL\n');
+
+  const previousSupabaseUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+  const chunks = [];
+  const originalLog = console.log;
+  console.log = (...args) => chunks.push(args.join(' '));
+  try {
+    const code = run(['--target=compose', `--env-file=${file}`, '--json']);
+    assert.equal(code, 1);
+    const payload = JSON.parse(chunks.join('\n'));
+    assert.equal(payload.target, 'compose');
+    assert.equal(payload.ok, false);
+    assert.ok(Array.isArray(payload.errors));
+    const codes = payload.errors.map((e) => e.code);
+    assert.ok(codes.includes('INVALID_URL'));
+    const names = payload.errors.flatMap((e) => e.variables || []);
+    assert.ok(names.includes('SUPABASE_URL'));
+    assert.equal(JSON.stringify(payload).includes('not a URL'), false);
+  } finally {
+    console.log = originalLog;
+    if (previousSupabaseUrl === undefined) delete process.env.SUPABASE_URL;
+    else process.env.SUPABASE_URL = previousSupabaseUrl;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('run --json exits zero for a valid environment', async () => {
+  const { run } = await checkEnv;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'check-env-test-'));
+  const file = path.join(dir, '.env');
+  fs.writeFileSync(file, 'SUPABASE_URL=http://localhost:54321\n');
+
+  const previousSupabaseUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+  const chunks = [];
+  const originalLog = console.log;
+  console.log = (...args) => chunks.push(args.join(' '));
+  try {
+    const code = run(['--target=compose', `--env-file=${file}`, '--json']);
+    assert.equal(code, 0);
+    const payload = JSON.parse(chunks.join('\n'));
+    assert.equal(payload.ok, true);
+    assert.deepEqual(payload.errors, []);
+  } finally {
+    console.log = originalLog;
+    if (previousSupabaseUrl === undefined) delete process.env.SUPABASE_URL;
+    else process.env.SUPABASE_URL = previousSupabaseUrl;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('strict mainnet mode rejects testnet identifiers and insecure remote endpoints', async () => {
+  const { validateEnv } = await checkEnv;
+  const spec = [
+    { name: 'SUPABASE_URL', description: 'Supabase URL' },
+    { name: 'STELLAR_NETWORK', description: 'Network' },
+  ];
+
+  const testnet = validateEnv(
+    spec,
+    { SUPABASE_URL: 'https://example.supabase.co', STELLAR_NETWORK: 'testnet' },
+    'k8s',
+    { strict: true }
+  );
+  assert.equal(testnet.ok, false);
+  assert.ok(testnet.errors.some((e) => e.code === 'TESTNET_CONFIG'));
+
+  const insecure = validateEnv(
+    spec,
+    { SUPABASE_URL: 'http://example.supabase.co', STELLAR_NETWORK: 'mainnet' },
+    'k8s',
+    { strict: true }
+  );
+  assert.equal(insecure.ok, false);
+  assert.ok(insecure.errors.some((e) => e.code === 'INSECURE_ENDPOINT'));
+
+  const local = validateEnv(
+    spec,
+    { SUPABASE_URL: 'http://localhost:54321', STELLAR_NETWORK: 'testnet' },
+    'compose'
+  );
+  assert.equal(local.ok, true);
+});
+
 test('validateEnv enforces target-specific URL protocols and parses URL syntax', async () => {
   const { validateEnv } = await checkEnv;
   const previousSupabaseUrl = process.env.SUPABASE_URL;

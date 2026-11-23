@@ -8,7 +8,8 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
+const http = require('http');
 const { pathToFileURL } = require('url');
 const { Keypair } = require('@stellar/stellar-sdk');
 
@@ -95,6 +96,67 @@ test('06-smoke-test.js exits 0 when all 6 checks pass', () => {
   assert.equal(status, 0);
   assert.match(stdout, /6 passed  \/  0 failed/);
   assert.equal(requested.length, 9);
+});
+
+test('06-smoke-test.js exits nonzero within a bounded time when the server never responds', async () => {
+  // A server that accepts TCP connections but never writes a response.
+  const sockets = new Set();
+  const server = http.createServer(() => {
+    /* intentionally never respond */
+  });
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const { port } = server.address();
+
+  const startedAt = Date.now();
+  let status = 0;
+  let stdout = '';
+  let stderr = '';
+
+  try {
+    await new Promise((resolve) => {
+      const child = spawn(process.execPath, [SMOKE_SCRIPT], {
+        env: {
+          ...process.env,
+          BACKEND_URL: `http://127.0.0.1:${port}`,
+          PUBLISHER1_PUBLIC: Keypair.random().publicKey(),
+          PUBLISHER2_PUBLIC: Keypair.random().publicKey(),
+          ADMIN_API_KEY: 'test-admin-key',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk;
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk;
+      });
+      child.on('close', (code) => {
+        status = code ?? 1;
+        resolve();
+      });
+    });
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise((resolve) => server.close(resolve));
+  }
+
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.notEqual(status, 0, 'smoke test should fail when the server never responds');
+  // Bounded: every request must be aborted well before this generous ceiling.
+  assert.ok(
+    elapsedMs < 120000,
+    `smoke test should finish within a bounded time, took ${elapsedMs}ms`
+  );
+  assert.match(stdout + stderr, /timed out|abort/i);
 });
 
 test('06-smoke-test.js exits 1 when paywall does not return 402', () => {
