@@ -119,6 +119,170 @@ jobs:
           # the actual placeholder check is enforced in deploy workflows where
           # real secrets are available via GitHub Actions secrets.
           node scripts/check-env.js --help > /dev/null
+      - name: Check env JSON output mode
+        run: |
+          cp .env.example .env
+          # Placeholder values may fail validation, so tolerate a non-zero exit
+          # but require the output to be valid JSON with the expected shape.
+          set +e
+          node scripts/check-env.js --target compose --env-file .env --json > env-report.json
+          status=$?
+          set -e
+          echo "check-env.js --json exit status: ${status}"
+          python3 - <<'EOF'
+          import json
+          import sys
+
+          with open('env-report.json', encoding='utf-8') as handle:
+              report = json.load(handle)
+
+          if not isinstance(report, dict):
+              sys.exit('JSON report must be an object')
+          if 'target' not in report:
+              sys.exit('JSON report missing "target"')
+          if 'errors' not in report or not isinstance(report['errors'], list):
+              sys.exit('JSON report missing "errors" list')
+          for entry in report['errors']:
+              if not isinstance(entry, dict):
+                  sys.exit('Each error entry must be an object')
+              if 'code' not in entry:
+                  sys.exit('Error entry missing "code"')
+              if 'variables' not in entry:
+                  sys.exit('Error entry missing "variables"')
+          print('JSON report shape OK')
+          EOF
+      - name: Check env strict mode (known-good fixture)
+        run: |
+          # A minimal, fully populated mainnet configuration that must pass
+          # --strict. Keep this fixture in sync with the strict rules in
+          # scripts/check-env.js and docs/deployment.md.
+          cat > strict.env <<'EOF'
+          NETWORK=mainnet
+          RPC_URL=https://rpc.mainnet.example.com
+          WS_URL=wss://ws.mainnet.example.com
+          API_URL=https://api.mainnet.example.com
+          CONTRACT_ID=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+          JWT_SECRET=strict-fixture-jwt-secret-value
+          DATABASE_URL=postgres://user:pass@db.internal:5432/synapsvault
+          EOF
+          node scripts/check-env.js --target compose --env-file strict.env --strict
+          # Strict mode must reject testnet configuration.
+          sed 's/^NETWORK=mainnet$/NETWORK=testnet/' strict.env > strict-testnet.env
+          if node scripts/check-env.js --target compose --env-file strict-testnet.env --strict; then
+            echo "::error::--strict accepted a testnet configuration"
+            exit 1
+          fi
+          # Strict mode must reject insecure remote endpoints.
+          sed 's#^RPC_URL=.*#RPC_URL=http://rpc.mainnet.example.com#' strict.env > strict-insecure.env
+          if node scripts/check-env.js --target compose --env-file strict-insecure.env --strict; then
+            echo "::error::--strict accepted an insecure remote endpoint"
+            exit 1
+          fi
+      - name: Check env duplicate key detection
+        run: |
+          # Duplicate assignments must be reported with line numbers.
+          printf 'NETWORK=mainnet\nNETWORK=testnet\n' > duplicate.env
+          set +e
+          output="$(node scripts/check-env.js --target compose --env-file duplicate.env 2>&1)"
+          status=$?
+          set -e
+          echo "${output}"
+          if [ "${status}" -eq 0 ]; then
+            echo "::error::Duplicate keys were not reported"
+            exit 1
+          fi
+          if ! echo "${output}" | grep -q 'NETWORK'; then
+            echo "::error::Duplicate report did not mention the affected variable"
+            exit 1
+          fi
+          if ! echo "${output}" | grep -Eq 'line[^0-9]*[0-9]+'; then
+            echo "::error::Duplicate report did not include line numbers"
+            exit 1
+          fi
+      - name: Verify check-env validation rules
+        run: |
+          set -euo pipefail
+          work_dir="$(mktemp -d)"
+          trap 'rm -rf "${work_dir}"' EXIT
+
+          # Generate a valid Stellar keypair for the positive cases.
+          keypair="$(node scripts/01-generate-keypairs.js)"
+          public_key="$(printf '%s\n' "${keypair}" | sed -n 's/^Public [Kk]ey: *//p' | head -n1)"
+          secret_key="$(printf '%s\n' "${keypair}" | sed -n 's/^Secret [Kk]ey: *//p' | head -n1)"
+          if [ -z "${public_key}" ] || [ -z "${secret_key}" ]; then
+            echo "::error::Could not parse generated keypair"
+            exit 1
+          fi
+
+          # A valid contract ID (StrKey C...) for checksum validation.
+          contract_id="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+
+          base_env() {
+            cat <<EOF
+          STELLAR_NETWORK=testnet
+          STELLAR_PUBLIC_KEY=${public_key}
+          STELLAR_SECRET_KEY=${secret_key}
+          STELLAR_CONTRACT_ID=${contract_id}
+          EOF
+          }
+
+          expect_pass() {
+            local name="$1" file="$2"
+            if ! node scripts/check-env.js --target compose --env-file "${file}" > "${work_dir}/out.log" 2>&1; then
+              echo "::error::check-env rejected valid case: ${name}"
+              cat "${work_dir}/out.log"
+              exit 1
+            fi
+          }
+
+          expect_fail() {
+            local name="$1" file="$2" pattern="$3"
+            if node scripts/check-env.js --target compose --env-file "${file}" > "${work_dir}/out.log" 2>&1; then
+              echo "::error::check-env accepted invalid case: ${name}"
+              cat "${work_dir}/out.log"
+              exit 1
+            fi
+            if ! grep -Eq "${pattern}" "${work_dir}/out.log"; then
+              echo "::error::check-env error for ${name} did not match ${pattern}"
+              cat "${work_dir}/out.log"
+              exit 1
+            fi
+            # Secrets must never be echoed in diagnostics.
+            if grep -qF "${secret_key}" "${work_dir}/out.log"; then
+              echo "::error::check-env leaked the secret key for ${name}"
+              exit 1
+            fi
+          }
+
+          # Positive: documented networks are accepted.
+          for network in testnet mainnet futurenet; do
+            base_env | sed "s/^STELLAR_NETWORK=.*/STELLAR_NETWORK=${network}/" > "${work_dir}/valid-${network}.env"
+            expect_pass "network ${network}" "${work_dir}/valid-${network}.env"
+          done
+
+          # Negative: unsupported network values are rejected.
+          base_env | sed 's/^STELLAR_NETWORK=.*/STELLAR_NETWORK=devnet/' > "${work_dir}/bad-network.env"
+          expect_fail "unsupported network" "${work_dir}/bad-network.env" 'STELLAR_NETWORK'
+
+          # Negative: checksum-invalid account, secret and contract IDs.
+          base_env | sed "s/^STELLAR_PUBLIC_KEY=.*/STELLAR_PUBLIC_KEY=GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF/" > "${work_dir}/bad-public.env"
+          expect_fail "bad public key checksum" "${work_dir}/bad-public.env" 'STELLAR_PUBLIC_KEY'
+          base_env | sed "s/^STELLAR_SECRET_KEY=.*/STELLAR_SECRET_KEY=SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF/" > "${work_dir}/bad-secret.env"
+          expect_fail "bad secret key checksum" "${work_dir}/bad-secret.env" 'STELLAR_SECRET_KEY'
+          base_env | sed "s/^STELLAR_CONTRACT_ID=.*/STELLAR_CONTRACT_ID=CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF/" > "${work_dir}/bad-contract.env"
+          expect_fail "bad contract checksum" "${work_dir}/bad-contract.env" 'STELLAR_CONTRACT_ID'
+
+          # Negative: public key does not match the secret key.
+          other_keypair="$(node scripts/01-generate-keypairs.js)"
+          other_public="$(printf '%s\n' "${other_keypair}" | sed -n 's/^Public [Kk]ey: *//p' | head -n1)"
+          base_env | sed "s/^STELLAR_PUBLIC_KEY=.*/STELLAR_PUBLIC_KEY=${other_public}/" > "${work_dir}/mismatch.env"
+          expect_fail "keypair mismatch" "${work_dir}/mismatch.env" 'STELLAR_(PUBLIC|SECRET)_KEY'
+
+          # Negative: whitespace-only required values are treated as missing.
+          base_env | sed 's/^STELLAR_NETWORK=.*/STELLAR_NETWORK="   "/' > "${work_dir}/blank-network.env"
+          expect_fail "whitespace-only network" "${work_dir}/blank-network.env" 'STELLAR_NETWORK'
+          base_env | sed 's/^STELLAR_PUBLIC_KEY=.*/STELLAR_PUBLIC_KEY="  "/' > "${work_dir}/blank-public.env"
+          expect_fail "whitespace-only public key" "${work_dir}/blank-public.env" 'STELLAR_PUBLIC_KEY'
       - name: Lint Node scripts
         run: npm run lint
       - name: Unit tests
@@ -237,7 +401,26 @@ jobs:
           DEPLOY_DOCKERFILES_DIR: ../..
         run: docker compose up -d --wait
       - name: Run smoke test
-        run: node scripts/06-smoke-test.js
+        # --report writes a machine-readable JSON report (check names, duration,
+        # result and sanitized errors). The script still exits nonzero on any
+        # failed check, and the report never contains admin credentials.
+        # --frontend-url is optional; when set, the frontend's config.js is
+        # fetched and its network/API base are verified against this deployment.
+        env:
+          SMOKE_FRONTEND_URL: ${{ vars.SMOKE_FRONTEND_URL }}
+        run: |
+          args=(--report smoke-report.json)
+          if [ -n "${SMOKE_FRONTEND_URL:-}" ]; then
+            args+=(--frontend-url "${SMOKE_FRONTEND_URL}")
+          fi
+          node scripts/06-smoke-test.js "${args[@]}"
+      - name: Upload smoke-test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-report
+          path: smoke-report.json
+          if-no-files-found: ignore
       - name: Dump logs on failure
         if: failure()
         run: docker compose logs --no-color
