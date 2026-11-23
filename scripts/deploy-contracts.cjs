@@ -30,7 +30,9 @@
  *                         to the deployer's public key.
  */
 
+const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const readline = require('readline');
 
@@ -91,11 +93,22 @@ const MIN_BALANCE_STROOPS = 100_000_000n; // 10 XLM
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
-  const args = { network: null, dryRun: false, yes: false, wasmDir: null };
+  const args = {
+    network: null,
+    dryRun: false,
+    plan: false,
+    yes: false,
+    wasmDir: null,
+    manifest: null,
+    verifyRecord: null,
+  };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--dry-run') {
+      args.dryRun = true;
+    } else if (arg === '--plan') {
+      args.plan = true;
       args.dryRun = true;
     } else if (arg === '--yes' || arg === '-y') {
       args.yes = true;
@@ -107,6 +120,22 @@ function parseArgs(argv) {
       args.wasmDir = value;
     } else if (arg.startsWith('--wasm-dir=')) {
       args.wasmDir = arg.slice('--wasm-dir='.length);
+    } else if (arg === '--manifest') {
+      const value = argv[++i];
+      if (!value) {
+        throw new Error('--manifest requires a value');
+      }
+      args.manifest = value;
+    } else if (arg.startsWith('--manifest=')) {
+      args.manifest = arg.slice('--manifest='.length);
+    } else if (arg === '--verify-record') {
+      const value = argv[++i];
+      if (!value) {
+        throw new Error('--verify-record requires a value');
+      }
+      args.verifyRecord = value;
+    } else if (arg.startsWith('--verify-record=')) {
+      args.verifyRecord = arg.slice('--verify-record='.length);
     } else if (arg === '--network') {
       const value = argv[++i];
       if (!value) {
@@ -140,8 +169,16 @@ Options:
                                          For local Stellar/Quickstart node, set SOROBAN_RPC_URL.
   --wasm-dir <dir>                       Directory containing the built contract *.wasm files
                                          (defaults to $CONTRACTS_WASM_DIR, then ./target/wasm32-unknown-unknown/release).
+  --manifest <path>                      JSON manifest mapping WASM artifact filenames to expected
+                                         SHA-256 checksums. Artifacts are validated before any
+                                         transaction is signed.
+  --verify-record <path>                 Re-read a deployment record, fetch current on-chain
+                                         executable hashes, and report mismatches (read-only).
   --yes, -y                              Skip the interactive mainnet confirmation (for CI).
   --dry-run                              Perform all checks without submitting transactions.
+  --plan                                 Read-only planning mode: report network, artifact hashes,
+                                         signer public key and planned operations without signing
+                                         or submitting anything (implies --dry-run).
   --help, -h                             Show this help message.
 `);
 }
@@ -209,6 +246,203 @@ function validateEnv(args) {
 }
 
 // ---------------------------------------------------------------------------
+// Build manifest / artifact checksums
+// ---------------------------------------------------------------------------
+
+/**
+ * Load an optional build manifest mapping WASM artifact filenames (or paths)
+ * to expected SHA-256 checksums. Returns null when no manifest is configured.
+ *
+ * Accepted shapes:
+ *   { "vault_registry.wasm": "<sha256 hex>", ... }
+ *   { "artifacts": { "vault_registry.wasm": "<sha256 hex>" } }
+ *   { "artifacts": [ { "file": "vault_registry.wasm", "sha256": "<hex>" } ] }
+ */
+function loadManifest(manifestPath) {
+  if (!manifestPath) return null;
+
+  const resolved = path.resolve(manifestPath);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Build manifest not found: ${resolved}`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+  } catch (err) {
+    throw new Error(`Build manifest is not valid JSON (${resolved}): ${err.message}`);
+  }
+
+  const entries = new Map();
+  const addEntry = (file, checksum) => {
+    if (typeof file !== 'string' || typeof checksum !== 'string') {
+      throw new Error(`Build manifest entry must map a filename to a checksum string: ${file}`);
+    }
+    const normalized = checksum.trim().toLowerCase().replace(/^sha256:/, '');
+    if (!/^[0-9a-f]{64}$/.test(normalized)) {
+      throw new Error(`Build manifest checksum for "${file}" is not a valid SHA-256 hex digest`);
+    }
+    entries.set(path.basename(file), normalized);
+  };
+
+  const source = parsed && parsed.artifacts ? parsed.artifacts : parsed;
+  if (Array.isArray(source)) {
+    for (const item of source) {
+      if (!item || typeof item !== 'object') {
+        throw new Error('Build manifest artifact entries must be objects');
+      }
+      addEntry(item.file || item.name, item.sha256 || item.checksum);
+    }
+  } else if (source && typeof source === 'object') {
+    for (const [file, checksum] of Object.entries(source)) {
+      addEntry(file, checksum);
+    }
+  } else {
+    throw new Error(`Build manifest has an unsupported shape: ${resolved}`);
+  }
+
+  return { path: resolved, entries };
+}
+
+function hashWasmFile(wasmPath) {
+  const data = fs.readFileSync(wasmPath);
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+/**
+ * Validate every artifact against the manifest. Throws before any transaction
+ * is built or signed when an artifact is missing from the manifest or its
+ * checksum does not match.
+ */
+function validateManifest(manifest, contracts) {
+  if (!manifest) {
+    log.warn('No build manifest provided; skipping artifact checksum validation.');
+    return {};
+  }
+
+  log.step('Validating artifact checksums against build manifest');
+  const hashes = {};
+  const problems = [];
+
+  for (const contract of contracts) {
+    const expected = manifest.entries.get(path.basename(contract.wasmFile));
+    if (!expected) {
+      problems.push(`"${contract.name}" (${contract.wasmFile}) is missing from the build manifest`);
+      continue;
+    }
+    if (!fs.existsSync(contract.wasm)) {
+      problems.push(`"${contract.name}" WASM file not found: ${contract.wasm}`);
+      continue;
+    }
+    const actual = hashWasmFile(contract.wasm);
+    hashes[contract.name] = actual;
+    if (actual !== expected) {
+      problems.push(
+        `"${contract.name}" checksum mismatch: expected ${expected}, got ${actual} (${contract.wasm})`
+      );
+    } else {
+      log.ok(`Checksum verified for "${contract.name}": ${actual}`);
+    }
+  }
+
+  if (problems.length > 0) {
+    throw new Error(
+      `Artifact checksum validation failed; refusing to sign any deployment transaction:\n  - ${problems.join('\n  - ')}`
+    );
+  }
+
+  return hashes;
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency guard (lockfile keyed by network + signer)
+// ---------------------------------------------------------------------------
+
+const LOCK_STALE_MS = 30 * 60 * 1000; // 30 minutes
+
+function lockFilePath(network, publicKey) {
+  return path.join(ROOT_DIR, `.deploy-lock-${network}-${publicKey}.lock`);
+}
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
+/**
+ * Acquire an exclusive deployment lock for the given network + signer.
+ * Fails fast when another live deployment holds the lock. Stale locks (dead
+ * PID or older than LOCK_STALE_MS) are reclaimed.
+ */
+function acquireLock(network, publicKey) {
+  const file = lockFilePath(network, publicKey);
+  const payload = JSON.stringify({
+    pid: process.pid,
+    hostname: os.hostname(),
+    network,
+    publicKey,
+    timestamp: new Date().toISOString(),
+  });
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(file, 'wx');
+      fs.writeSync(fd, payload);
+      fs.closeSync(fd);
+      log.ok(`Acquired deployment lock ${path.basename(file)}`);
+      return file;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+
+      let existing = null;
+      try {
+        existing = JSON.parse(fs.readFileSync(file, 'utf8'));
+      } catch (_) {
+        existing = null;
+      }
+
+      const age = existing && existing.timestamp ? Date.now() - Date.parse(existing.timestamp) : Infinity;
+      const alive = existing ? isProcessAlive(existing.pid) : false;
+      const stale = !existing || !alive || age > LOCK_STALE_MS;
+
+      if (!stale) {
+        throw new Error(
+          `Another deployment holds the lock for ${network} / ${publicKey} ` +
+            `(pid ${existing.pid}, host ${existing.hostname || 'unknown'}, since ${existing.timestamp}). ` +
+            `Wait for it to finish or remove ${file} if it is stale.`
+        );
+      }
+
+      log.warn(`Reclaiming stale deployment lock ${path.basename(file)}`);
+      try {
+        fs.unlinkSync(file);
+      } catch (unlinkErr) {
+        if (unlinkErr.code !== 'ENOENT') throw unlinkErr;
+      }
+    }
+  }
+
+  throw new Error(`Unable to acquire deployment lock ${file}`);
+}
+
+function releaseLock(file) {
+  if (!file) return;
+  try {
+    fs.unlinkSync(file);
+    log.info(`Released deployment lock ${path.basename(file)}`);
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      log.warn(`Failed to release deployment lock ${file}: ${err.message}`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Mainnet confirmation prompt
 // ---------------------------------------------------------------------------
 
@@ -243,8 +477,11 @@ function confirmMainnet(network, assumeYes) {
 // Pre-flight checks
 // ---------------------------------------------------------------------------
 
-async function preflightChecks({ server, keypair, network, contracts, dryRun }) {
+async function preflightChecks({ server, keypair, network, contracts, dryRun, manifest }) {
   log.step('Running pre-flight checks');
+
+  // 0. Artifact checksum validation (before any transaction is signed).
+  validateManifest(manifest, contracts);
 
   // 1. Network passphrase sanity check.
   const networkPassphrase = NETWORK_PASSPHRASES[network];
@@ -490,6 +727,20 @@ async function initContract({
 // On-chain verification
 // ---------------------------------------------------------------------------
 
+async function fetchOnChainWasmHash(server, contractId) {
+  const ledgerEntries = await server.getContractData(
+    contractId,
+    xdr.ScVal.scvLedgerKeyContractInstance(),
+    rpc.Durability.Persistent
+  );
+  if (!ledgerEntries || !ledgerEntries.val) return null;
+
+  const executable = ledgerEntries.val.value?.executable;
+  const wasmHash = executable?.wasmHash ?? executable?.value?.();
+  if (!wasmHash) return null;
+  return Buffer.from(wasmHash).toString('hex');
+}
+
 async function verifyContract({ server, contractId, dryRun, contractName, expectedAdmin }) {
   log.step(`Verifying contract "${contractName}"`);
 
@@ -590,8 +841,25 @@ function writeContractIds(contractIds, network, dryRun) {
   log.ok(`Wrote contract IDs to ${CONTRACT_IDS_FILE}`);
 }
 
-function writeDeploymentRecord(contractIds, network, adminAddress, deployer, txHashes, dryRun) {
+function writeDeploymentRecord(
+  contractIds,
+  network,
+  adminAddress,
+  deployer,
+  txHashes,
+  dryRun,
+  hashes = {}
+) {
   log.step('Writing deployment record');
+
+  const contractRecords = {};
+  for (const [name, id] of Object.entries(contractIds)) {
+    contractRecords[name] = {
+      contractId: id,
+      artifactHash: hashes[name]?.artifactHash ?? null,
+      onChainHash: hashes[name]?.onChainHash ?? null,
+    };
+  }
 
   const deploymentJson = {
     timestamp: new Date().toISOString(),
@@ -599,6 +867,7 @@ function writeDeploymentRecord(contractIds, network, adminAddress, deployer, txH
     deployer,
     adminAddress,
     contracts: contractIds,
+    contractHashes: contractRecords,
     transactionHashes: txHashes,
     gitRef: process.env.GIT_REF || null,
   };
@@ -614,6 +883,105 @@ function writeDeploymentRecord(contractIds, network, adminAddress, deployer, txH
 
   fs.writeFileSync(recordFile, content, { encoding: 'utf8' });
   log.ok(`Wrote deployment record to ${recordFile}`);
+  return recordFile;
+}
+
+/**
+ * Re-read a deployment record, fetch current on-chain executable hashes and
+ * compare them to the recorded values. Returns { ok, mismatches }.
+ */
+async function verifyDeploymentRecord({ server, recordPath }) {
+  log.step('Verifying deployment record against on-chain state');
+
+  const resolved = path.resolve(recordPath);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Deployment record not found: ${resolved}`);
+  }
+  const record = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+  const recorded = record.contractHashes || {};
+  const mismatches = [];
+
+  for (const [name, id] of Object.entries(record.contracts || {})) {
+    const expected = recorded[name]?.onChainHash || null;
+    let actual = null;
+    try {
+      actual = await fetchOnChainWasmHash(server, id);
+    } catch (err) {
+      mismatches.push(`${name} (${id}): unable to fetch on-chain hash (${err.message})`);
+      continue;
+    }
+
+    if (!expected) {
+      log.warn(`${name} (${id}): no recorded on-chain hash to compare`);
+      continue;
+    }
+    if (actual !== expected) {
+      mismatches.push(`${name} (${id}): recorded ${expected}, on-chain ${actual || 'unknown'}`);
+    } else {
+      log.ok(`${name} (${id}): on-chain hash matches record (${actual})`);
+    }
+  }
+
+  if (mismatches.length > 0) {
+    log.error('Deployment record verification failed:');
+    for (const m of mismatches) log.error(`  - ${m}`);
+    return { ok: false, mismatches };
+  }
+
+  log.ok('All recorded hashes agree with deployed contracts');
+  return { ok: true, mismatches };
+}
+
+// ---------------------------------------------------------------------------
+// Read-only planning mode
+// ---------------------------------------------------------------------------
+
+function maskSecret(value) {
+  if (!value) return '<unset>';
+  return `${value.slice(0, 4)}…${value.slice(-4)} (masked)`;
+}
+
+/**
+ * Report the resolved network, artifact hashes, signer public key and planned
+ * contract operations without signing or submitting anything. Never prints
+ * secret material.
+ */
+function planDeployment({ network, rpcUrl, contracts, keypair, adminAddress, manifest, existingIds = {} }) {
+  log.step('Deployment plan (read-only)');
+
+  const artifactHashes = {};
+  for (const contract of contracts) {
+    artifactHashes[contract.name] = fs.existsSync(contract.wasm)
+      ? hashWasmFile(contract.wasm)
+      : '<missing>';
+  }
+
+  const plan = {
+    network,
+    rpcUrl,
+    signerPublicKey: keypair.publicKey(),
+    secretKey: maskSecret(process.env.STELLAR_SECRET_KEY),
+    adminAddress,
+    manifest: manifest ? manifest.path : null,
+    artifacts: contracts.map((c) => ({
+      name: c.name,
+      wasm: c.wasm,
+      artifactHash: artifactHashes[c.name],
+      action: existingIds[c.name] ? 'skip (already deployed)' : 'upload + deploy + init',
+      existingContractId: existingIds[c.name] || null,
+    })),
+    plannedOperations: contracts
+      .filter((c) => !existingIds[c.name])
+      .flatMap((c) => [
+        `uploadContractWasm(${c.wasmFile})`,
+        `createCustomContract(${c.name})`,
+        `init(${adminAddress}) on ${c.name}`,
+      ]),
+  };
+
+  console.log(JSON.stringify(plan, null, 2));
+  log.warn('Plan mode: no transactions were signed or submitted.');
+  return plan;
 }
 
 // ---------------------------------------------------------------------------
@@ -632,15 +1000,51 @@ async function main() {
     log.warn('Running in DRY-RUN mode');
   }
 
+  const manifest = loadManifest(args.manifest);
+  const server = new rpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith('http://') });
+
+  // Read-only record verification: no signing or submission.
+  if (args.verifyRecord) {
+    const { ok } = await verifyDeploymentRecord({ server, recordPath: args.verifyRecord });
+    if (!ok) process.exit(1);
+    return;
+  }
+
+  // Read-only planning mode: never signs or submits.
+  if (args.plan) {
+    validateManifest(manifest, contracts);
+    const existingIds = loadExistingContractIds(network);
+    planDeployment({ network, rpcUrl, contracts, keypair, adminAddress, manifest, existingIds });
+    return;
+  }
+
   const confirmed = await confirmMainnet(network, args.yes);
   if (!confirmed) {
     log.error('Mainnet deployment not confirmed. Aborting.');
     process.exit(1);
   }
 
-  const server = new rpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith('http://') });
+  // Concurrency guard: acquire before any signing/submission.
+  const lockFile = args.dryRun ? null : acquireLock(network, keypair.publicKey());
 
-  await preflightChecks({ server, keypair, network, contracts, dryRun: args.dryRun });
+  try {
+    await runDeployment({ args, server, keypair, network, networkPassphrase, adminAddress, contracts, manifest });
+  } finally {
+    releaseLock(lockFile);
+  }
+}
+
+async function runDeployment({
+  args,
+  server,
+  keypair,
+  network,
+  networkPassphrase,
+  adminAddress,
+  contracts,
+  manifest,
+}) {
+  await preflightChecks({ server, keypair, network, contracts, dryRun: args.dryRun, manifest });
 
   log.info(`Admin address for init(): ${adminAddress}`);
 
@@ -650,6 +1054,7 @@ async function main() {
     await verifyContract({ server, contractId, contractName, dryRun: false });
   }
   const contractIds = { ...existingIds };
+  const hashes = {};
 
   const contractsToDeploy = contracts.filter((c) => !existingIds[c.name]);
 
@@ -661,6 +1066,7 @@ async function main() {
   }
 
   for (const contract of contractsToDeploy) {
+    const artifactHash = hashWasmFile(contract.wasm);
     const wasmHash = await uploadWasm({
       server,
       keypair,
@@ -697,11 +1103,30 @@ async function main() {
       expectedAdmin: adminAddress,
     });
 
+    let onChainHash = null;
+    if (!args.dryRun) {
+      onChainHash = await fetchOnChainWasmHash(server, contractId);
+      if (onChainHash && onChainHash !== artifactHash) {
+        log.warn(
+          `On-chain executable hash for "${contract.name}" (${onChainHash}) differs from local artifact (${artifactHash})`
+        );
+      }
+    }
+
+    hashes[contract.name] = { artifactHash, onChainHash };
     contractIds[contract.name] = contractId;
   }
 
   writeContractIds(contractIds, network, args.dryRun);
-  writeDeploymentRecord(contractIds, network, adminAddress, keypair.publicKey(), {}, args.dryRun);
+  writeDeploymentRecord(
+    contractIds,
+    network,
+    adminAddress,
+    keypair.publicKey(),
+    {},
+    args.dryRun,
+    hashes
+  );
 
   log.step('Deployment complete');
   for (const [name, id] of Object.entries(contractIds)) {
@@ -724,6 +1149,12 @@ module.exports = {
   validateEnv,
   CONTRACTS,
   contractEnvName,
+  loadManifest,
+  hashWasmFile,
+  validateManifest,
+  acquireLock,
+  releaseLock,
+  lockFilePath,
   preflightChecks,
   submitTransaction,
   pollTransaction,
@@ -731,7 +1162,10 @@ module.exports = {
   deployContract,
   initContract,
   verifyContract,
+  fetchOnChainWasmHash,
   loadExistingContractIds,
   writeContractIds,
   writeDeploymentRecord,
+  verifyDeploymentRecord,
+  planDeployment,
 };
