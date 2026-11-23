@@ -230,8 +230,19 @@ When hosting PostgreSQL on Supabase in production, enable **Supabase Point-in-Ti
 - `aws` CLI, `psql`, `gpg` (or `age`), `tar`, `gzip`, `sha256sum`.
 - Access to the backup bucket and the encryption key.
 - A target PostgreSQL instance with sufficient capacity.
+- A target database role with the permissions the restore needs: `CREATE` on the target schema, `INSERT`/`TRUNCATE` on the tables being restored, and `CREATEDB` when running with `--verify-only` (which creates a throwaway database).
 
 `scripts/restore.sh` reads the same `BACKUP_STORAGE_*` and `BACKUP_ENCRYPTION_KEY` variables as `backup.sh` (for age-encrypted backups, set `BACKUP_AGE_IDENTITY_FILE` instead).
+
+### 7.1.1 Preflight checks
+
+Before any expensive work — downloading the archive, verifying its SHA-256, or decrypting it — `restore.sh` runs a preflight against the target database:
+
+- It checks that the target is reachable and that the role can connect.
+- It checks the required permissions: `CREATE` on the target schema, `INSERT`/`TRUNCATE` on the target tables, and `CREATEDB` when `--verify-only` is used.
+- It checks the target server version against the manifest's `postgres` metadata.
+
+If the target is unreachable or the role lacks a required permission, the script aborts immediately with a clear error and a non-zero exit code, **before** the archive is downloaded or decrypted. Because decryption never starts, no decrypted staging artifacts are left behind. The work directory is removed by a cleanup trap on every exit path (success, failure, or interrupt); pass `--keep-work-dir` only when you intentionally want to inspect extracted files, and remember that this also keeps any decrypted content for that run.
 
 ### 7.2 Steps
 
@@ -258,6 +269,7 @@ When hosting PostgreSQL on Supabase in production, enable **Supabase Point-in-Ti
    ```bash
    ./scripts/restore.sh --backup soroban-backup-<timestamp> --database-url "$DATABASE_URL"
    ```
+   The script first runs the preflight checks described in section 7.1.1 (target connectivity, required permissions, and PostgreSQL version compatibility) and aborts early with a clear error if they fail — before downloading or decrypting anything, so no decrypted staging artifacts are created. Once preflight passes, it downloads the manifest and archive, validates the manifest schema version and required fields, verifies the archive SHA-256, decrypts, then verifies each component checksum from `components` against the decrypted files before replaying the dump in a single transaction (a failed restore changes nothing). Objects in the target that are not in the backup are left in place. If the manifest's `postgres` versions are incompatible with the target server, the script warns (or aborts with `--verify-only`) before applying anything. The work directory is cleaned up by a trap on every exit path unless `--keep-work-dir` is given.
    The script downloads the manifest and archive, validates the manifest schema version and required fields, verifies the archive SHA-256, decrypts, then validates the decrypted tarball before extraction: member count and total uncompressed size must stay within the configured budgets, and no two members may normalize to the same path (see section 2). Only after these checks pass does it extract, verify each component checksum from `components` against the decrypted files, and replay the dump in a single transaction (a failed restore changes nothing). Objects in the target that are not in the backup are left in place. If the manifest's `postgres` versions are incompatible with the target server, the script warns (or aborts with `--verify-only`) before applying anything.
 
 5. **Inspect contract state snapshots (if needed).** Add `--keep-work-dir` to keep the extracted `contracts/` snapshots. On-chain state cannot be "restored"; use the snapshots to confirm which contract IDs the application should point at, and use `scripts/rollback-contracts.cjs` to repoint it.
@@ -284,6 +296,7 @@ After restore, verify the following:
 
 ### 7.4 Rollback
 
+If the restore fails, `restore.sh` rolls its transaction back and exits non-zero (2 = download/manifest validation/checksum, 3 = decryption or component checksum mismatch, 4 = restore, 5 = verification). Fix the cause and re-run, or re-attempt with an earlier backup. If the failure is an unsupported manifest `schemaVersion`, use a `restore.sh` from the matching or newer release. If preflight fails (unreachable target or missing permissions), fix connectivity or grant the required permissions and re-run; nothing was downloaded or decrypted, so there is no staging state to clean up. Document the failure and notify the on-call engineer.
 If the restore fails, `restore.sh` rolls its transaction back and exits non-zero (2 = download/manifest validation/checksum or archive validation failure such as an exceeded member/size budget or duplicate member paths, 3 = decryption or component checksum mismatch, 4 = restore, 5 = verification). Fix the cause and re-run, or re-attempt with an earlier backup. If the failure is an unsupported manifest `schemaVersion`, use a `restore.sh` from the matching or newer release. Document the failure and notify the on-call engineer.
 
 ## 8. Testing

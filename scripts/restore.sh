@@ -54,7 +54,8 @@
 #
 # Exit codes:
 #   0  success
-#   1  usage / configuration error
+#   1  usage / configuration error, or target preflight failure
+#      (unreachable database or missing required privileges)
 #   2  download or checksum failure
 #   3  decryption failure
 #   4  restore failure
@@ -260,6 +261,68 @@ case "$STORAGE_PROVIDER" in
 esac
 
 # ---------------------------------------------------------------------------
+# Target preflight
+# ---------------------------------------------------------------------------
+# Fail fast, before any download or decryption, when the target database is
+# unreachable or the role lacks the privileges the restore needs. This keeps
+# expensive work (and decrypted staging artifacts) from being produced for a
+# target that cannot accept the restore.
+preflight_target() {
+  local url="$1" verify_only="$2"
+
+  log "preflight: checking connectivity to target database"
+  if ! PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}" \
+       psql "$url" -v ON_ERROR_STOP=1 -X -At -q -c 'SELECT 1' >/dev/null 2>&1; then
+    die 1 "preflight failed: cannot connect to target database (check --database-url / DATABASE_URL, network access and credentials)"
+  fi
+
+  # The dump replays DROP/CREATE statements, so the role needs CREATE on the
+  # target database and on the public schema, plus TRUNCATE/INSERT on any
+  # existing tables it will overwrite.
+  local missing
+  missing="$(psql "$url" -v ON_ERROR_STOP=1 -X -At -q -c "
+    SELECT missing FROM (
+      SELECT 'CREATE on database' AS missing
+       WHERE NOT has_database_privilege(current_user, current_database(), 'CREATE')
+      UNION ALL
+      SELECT 'CREATE on schema public'
+       WHERE NOT has_schema_privilege(current_user, 'public', 'CREATE')
+      UNION ALL
+      SELECT 'TRUNCATE on ' || schemaname || '.' || tablename
+        FROM pg_tables
+       WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+         AND NOT has_table_privilege(current_user, quote_ident(schemaname) || '.' || quote_ident(tablename), 'TRUNCATE')
+      UNION ALL
+      SELECT 'INSERT on ' || schemaname || '.' || tablename
+        FROM pg_tables
+       WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+         AND NOT has_table_privilege(current_user, quote_ident(schemaname) || '.' || quote_ident(tablename), 'INSERT')
+    ) AS checks;
+  " 2>/dev/null)" || die 1 "preflight failed: could not evaluate target database privileges"
+
+  if [[ -n "$missing" ]]; then
+    log "preflight: missing required privileges:"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && log "  - $line"
+    done <<< "$missing"
+    die 1 "preflight failed: target role lacks required privileges (see above)"
+  fi
+
+  if [[ "$verify_only" == "true" ]]; then
+    log "preflight: checking CREATEDB for --verify-only"
+    local can_create
+    can_create="$(psql "$url" -v ON_ERROR_STOP=1 -X -At -q -c \
+      "SELECT rolcreatedb OR rolsuper FROM pg_roles WHERE rolname = current_user;" 2>/dev/null)" \
+      || die 1 "preflight failed: could not evaluate CREATEDB privilege"
+    if [[ "$can_create" != "t" ]]; then
+      die 1 "preflight failed: --verify-only requires the target role to have CREATEDB"
+    fi
+  fi
+
+  log "preflight: target database OK"
+}
+
+# ---------------------------------------------------------------------------
 # Working directory
 # ---------------------------------------------------------------------------
 if [[ -z "$WORK_DIR" ]]; then
@@ -271,6 +334,8 @@ else
 fi
 
 VERIFY_DB=""
+ARCHIVE_PATH=""
+EXTRACT_DIR=""
 
 # shellcheck disable=SC2317,SC2329  # invoked via the EXIT trap below
 cleanup() {
@@ -279,8 +344,16 @@ cleanup() {
     psql "$TARGET_DATABASE_URL" -X -q -c "DROP DATABASE IF EXISTS \"$VERIFY_DB\";" >/dev/null 2>&1 || \
       log "WARNING: could not drop verification database $VERIFY_DB"
   fi
-  if [[ "$KEEP_WORK_DIR" != "true" && "$CREATED_WORK_DIR" == "true" ]]; then
-    rm -rf "$WORK_DIR"
+  if [[ "$KEEP_WORK_DIR" != "true" ]]; then
+    # Remove decrypted staging artifacts on any failure, even when the caller
+    # supplied --work-dir, so plaintext dumps never linger after a failed run.
+    if [[ "$status" -ne 0 ]]; then
+      [[ -n "$ARCHIVE_PATH" && -f "$ARCHIVE_PATH" ]] && rm -f "$ARCHIVE_PATH"
+      [[ -n "$EXTRACT_DIR" && -d "$EXTRACT_DIR" ]] && rm -rf "$EXTRACT_DIR"
+    fi
+    if [[ "$CREATED_WORK_DIR" == "true" ]]; then
+      rm -rf "$WORK_DIR"
+    fi
   fi
   exit "$status"
 }
@@ -343,6 +416,11 @@ latest_backup_name() {
       ;;
   esac
 }
+
+# ---------------------------------------------------------------------------
+# Preflight the target before any download or decryption work
+# ---------------------------------------------------------------------------
+preflight_target "$TARGET_DATABASE_URL" "$VERIFY_ONLY"
 
 # ---------------------------------------------------------------------------
 # Download, verify, decrypt, extract

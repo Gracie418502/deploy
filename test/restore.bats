@@ -154,6 +154,63 @@ EOF
   [ "$status" -eq 0 ]
 }
 
+@test "preflight_database fails fast for an unreachable target without staging artifacts" {
+  local workdir="$BATS_TEST_TMPDIR/preflight-unreachable"
+  mkdir -p "$workdir"
+  local stubdir="$BATS_TEST_TMPDIR/stub-unreachable"
+  mkdir -p "$stubdir"
+  cat >"$stubdir/psql" <<'EOF'
+#!/usr/bin/env bash
+echo "psql: error: connection to server failed: Connection refused" >&2
+exit 2
+EOF
+  chmod +x "$stubdir/psql"
+
+  run env PATH="$stubdir:$PATH" preflight_database "postgres://user:pass@127.0.0.1:1/app" "$workdir"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"preflight"* || "$output" == *"connect"* || "$output" == *"unreachable"* ]]
+  [ ! -e "$workdir/backup.tar.gz" ]
+  [ ! -e "$workdir/database.sql" ]
+  [ ! -e "$workdir/contracts.tar.gz" ]
+  [ -z "$(find "$workdir" -mindepth 1 -print -quit)" ]
+}
+
+@test "preflight_database fails fast when the target role lacks permissions" {
+  local workdir="$BATS_TEST_TMPDIR/preflight-unauthorized"
+  mkdir -p "$workdir"
+  local stubdir="$BATS_TEST_TMPDIR/stub-unauthorized"
+  mkdir -p "$stubdir"
+  cat >"$stubdir/psql" <<'EOF'
+#!/usr/bin/env bash
+echo "psql: error: permission denied for database \"app\"" >&2
+exit 1
+EOF
+  chmod +x "$stubdir/psql"
+
+  run env PATH="$stubdir:$PATH" preflight_database "postgres://user:pass@localhost:5432/app" "$workdir"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"permission"* || "$output" == *"preflight"* ]]
+  [ ! -e "$workdir/backup.tar.gz" ]
+  [ ! -e "$workdir/database.sql" ]
+  [ ! -e "$workdir/contracts.tar.gz" ]
+  [ -z "$(find "$workdir" -mindepth 1 -print -quit)" ]
+}
+
+@test "preflight_database succeeds for an authorized target" {
+  local workdir="$BATS_TEST_TMPDIR/preflight-ok"
+  mkdir -p "$workdir"
+  local stubdir="$BATS_TEST_TMPDIR/stub-ok"
+  mkdir -p "$stubdir"
+  cat >"$stubdir/psql" <<'EOF'
+#!/usr/bin/env bash
+echo "1"
+exit 0
+EOF
+  chmod +x "$stubdir/psql"
+
+  run env PATH="$stubdir:$PATH" preflight_database "postgres://user:pass@localhost:5432/app" "$workdir"
+  [ "$status" -eq 0 ]
+  [ -z "$(find "$workdir" -mindepth 1 -print -quit)" ]
 @test "restore.sh --plan reports components, versions and target without mutating the database" {
   local workdir="$BATS_TEST_TMPDIR/plan-work"
   mkdir -p "$workdir/archive"
