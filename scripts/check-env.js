@@ -7,6 +7,7 @@
  *
  * Usage:
  *   node scripts/check-env.js [--target <compose|k8s|railway>] [--env-file <path>]
+ *                             [--json] [--strict|--mainnet]
  *
  * Options:
  *   --target   Deployment target to validate (default: compose)
@@ -14,12 +15,20 @@
  *              k8s      — Kubernetes / Kustomize deploy
  *              railway  — Railway backend deploy
  *   --env-file Path to the .env file to check (default: .env)
+ *   --json     Emit a machine-readable JSON result (no secret values) to stdout
+ *   --strict   Enable strict mainnet checks: reject testnet network identifiers
+ *              and insecure (http://) remote endpoints. Alias: --mainnet
  *   --help     Print this help message
  *
  * Exit codes:
  *   0  Required variables are set, non-placeholder, and valid for the target
- *   1  Variables are missing, contain placeholders, or have invalid URLs;
- *      or command-line arguments are invalid
+ *   1  Variables are missing, contain placeholders, have invalid URLs, or fail
+ *      strict mainnet checks; or command-line arguments are invalid
+ *
+ * Duplicate keys:
+ *   If a key is assigned more than once in the env file, every occurrence is
+ *   reported with its line number. The last assignment in the file wins, and
+ *   process.env always takes precedence over any file value.
  *
  * Placeholder patterns detected:
  *   - Keys that match S[XXX...] (Stellar secret key template)
@@ -259,21 +268,39 @@ const URL_PROTOCOLS = {
  *  - KEY=VALUE and KEY= (empty)
  *  - Blank lines
  *
+ * Duplicate keys: the last assignment in the file wins (deterministic policy).
+ * Call parseEnvFileDetailed() to also obtain per-key occurrence line numbers.
+ *
  * @param {string} filePath
  * @returns {Record<string, string>}
  */
 export function parseEnvFile(filePath) {
-  if (!existsSync(filePath)) return {};
-  const content = readFileSync(filePath, 'utf8');
+  return parseEnvFileDetailed(filePath).env;
+}
+
+/**
+ * Parse a .env file, returning both the resolved key→value map and the line
+ * numbers at which each key was assigned (in file order).
+ *
+ * @param {string} filePath
+ * @returns {{ env: Record<string, string>, occurrences: Record<string, number[]> }}
+ */
+export function parseEnvFileDetailed(filePath) {
   /** @type {Record<string, string>} */
   const env = {};
-  for (const rawLine of content.split('\n')) {
-    let line = rawLine.trim();
+  /** @type {Record<string, number[]>} */
+  const occurrences = {};
+  if (!existsSync(filePath)) return { env, occurrences };
+  const content = readFileSync(filePath, 'utf8');
+  const lines = content.split('\n');
+  for (let lineNo = 0; lineNo < lines.length; lineNo++) {
+    let line = lines[lineNo].trim();
     if (!line || line.startsWith('#')) continue;
     if (/^export\s+/.test(line)) line = line.replace(/^export\s+/, '');
     const eqIdx = line.indexOf('=');
     if (eqIdx === -1) continue;
     const key = line.slice(0, eqIdx).trim();
+    if (!key) continue;
     let value = line.slice(eqIdx + 1).trim();
     if (value.startsWith('"') || value.startsWith("'")) {
       const quote = value[0];
@@ -287,8 +314,22 @@ export function parseEnvFile(filePath) {
       if (commentIdx !== -1) value = value.slice(0, commentIdx).trim();
     }
     env[key] = value;
+    (occurrences[key] ??= []).push(lineNo + 1);
   }
-  return env;
+  return { env, occurrences };
+}
+
+/**
+ * Return the keys assigned more than once, with their 1-based line numbers.
+ *
+ * @param {Record<string, number[]>} occurrences
+ * @returns {Array<{ key: string, lines: number[] }>}
+ */
+export function findDuplicateKeys(occurrences) {
+  return Object.keys(occurrences)
+    .filter((key) => occurrences[key].length > 1)
+    .sort()
+    .map((key) => ({ key, lines: occurrences[key].slice() }));
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +339,21 @@ export function parseEnvFile(filePath) {
 /**
  * @typedef {Object} ValidationResult
  * @property {boolean}  ok
+ * @property {string[]} missing     Variables not set at all
+ * @property {string[]} placeholder Variables set to a placeholder value
+ * @property {string[]} invalidUrl  URL values with invalid syntax or protocols
+ * @property {string[]} testnet     Variables identifying a testnet (strict mode)
+ * @property {string[]} insecureUrl Remote endpoints using http:// (strict mode)
+ */
+
+/** Hostnames considered local (allowed to use http:// even in strict mode). */
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+/**
+ * Returns true if the hostname refers to the local machine.
+ *
+ * @param {string} hostname
+ * @returns {boolean}
  * @property {string[]} missing        Variables not set at all (or blank/whitespace-only)
  * @property {string[]} placeholder    Variables set to a placeholder value
  * @property {string[]} invalidUrl     URL values with invalid syntax or protocols
@@ -305,6 +361,9 @@ export function parseEnvFile(filePath) {
  * @property {string[]} invalidKey     StrKey fields with invalid encoding/checksum
  * @property {string[]} keyMismatch    STELLAR_PUBLIC_KEY does not match STELLAR_SECRET_KEY
  */
+function isLocalHost(hostname) {
+  return LOCAL_HOSTNAMES.has(hostname.toLowerCase());
+}
 
 /**
  * Validate a set of variable specs against the merged env (file + process).
@@ -312,12 +371,16 @@ export function parseEnvFile(filePath) {
  * @param {VarSpec[]}            specs
  * @param {Record<string,string>} fileEnv
  * @param {'compose'|'k8s'|'railway'} target
+ * @param {{ strict?: boolean }} [options]
  * @returns {ValidationResult}
  */
-export function validateEnv(specs, fileEnv, target) {
+export function validateEnv(specs, fileEnv, target, options = {}) {
+  const strict = options.strict === true;
   const missing = [];
   const placeholder = [];
   const invalidUrl = [];
+  const testnet = [];
+  const insecureUrl = [];
   const invalidNetwork = [];
   const invalidKey = [];
   const keyMismatch = [];
@@ -335,6 +398,17 @@ export function validateEnv(specs, fileEnv, target) {
     resolved[spec.name] = value;
     if (isPlaceholder(value)) {
       placeholder.push(spec.name);
+    } else {
+      const allowedProtocols = URL_PROTOCOLS[target][spec.name];
+      if (allowedProtocols) {
+        try {
+          const url = new URL(value);
+          if (!allowedProtocols.includes(url.protocol) || !url.hostname) {
+            invalidUrl.push(spec.name);
+          } else if (strict && url.protocol === 'http:' && !isLocalHost(url.hostname)) {
+            insecureUrl.push(spec.name);
+          }
+        } catch {
       continue;
     }
 
@@ -383,6 +457,9 @@ export function validateEnv(specs, fileEnv, target) {
       if (!invalidKey.includes('STELLAR_SECRET_KEY')) {
         invalidKey.push('STELLAR_SECRET_KEY');
       }
+      if (strict && spec.name === 'STELLAR_NETWORK' && /testnet/i.test(value)) {
+        testnet.push(spec.name);
+      }
     }
   }
 
@@ -391,6 +468,13 @@ export function validateEnv(specs, fileEnv, target) {
       missing.length === 0 &&
       placeholder.length === 0 &&
       invalidUrl.length === 0 &&
+      testnet.length === 0 &&
+      insecureUrl.length === 0,
+    missing,
+    placeholder,
+    invalidUrl,
+    testnet,
+    insecureUrl,
       invalidNetwork.length === 0 &&
       invalidKey.length === 0 &&
       keyMismatch.length === 0,
@@ -411,17 +495,23 @@ export function validateEnv(specs, fileEnv, target) {
  * Parse process.argv into an options object.
  *
  * @param {string[]} argv  process.argv.slice(2)
- * @returns {{ target: string, envFile: string, help: boolean }}
+ * @returns {{ target: string, envFile: string, help: boolean, json: boolean, strict: boolean }}
  */
 export function parseArgs(argv) {
   let target = 'compose';
   let envFile = '.env';
   let help = false;
+  let json = false;
+  let strict = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--help' || arg === '-h') {
       help = true;
+    } else if (arg === '--json') {
+      json = true;
+    } else if (arg === '--strict' || arg === '--mainnet') {
+      strict = true;
     } else if (arg === '--target' || arg === '-t') {
       const value = argv[++i];
       if (!value || value.startsWith('-')) {
@@ -445,7 +535,7 @@ export function parseArgs(argv) {
     }
   }
 
-  return { target, envFile, help };
+  return { target, envFile, help, json, strict };
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +547,7 @@ check-env.js — Validate .env variables for a deployment target
 
 Usage:
   node scripts/check-env.js [--target <compose|k8s|railway>] [--env-file <path>]
+                            [--json] [--strict|--mainnet]
 
 Options:
   --target   Deployment target (default: compose)
@@ -464,13 +555,62 @@ Options:
              k8s      — Kubernetes / Kustomize deploy
              railway  — Railway backend deploy
   --env-file Path to .env file (default: .env)
+  --json     Emit a machine-readable JSON result (no secret values) to stdout
+  --strict   Strict mainnet checks: reject testnet network identifiers and
+             insecure (http://) remote endpoints. Localhost is still allowed.
+             Alias: --mainnet
   --help     Print this help message
+
+Duplicate keys:
+  Duplicate assignments in the env file are reported with line numbers.
+  The last file assignment wins; process.env always takes precedence.
 
 Exit codes:
   0  All checks passed
+  1  Missing variables, placeholders, invalid URLs, strict-mode failures,
+     or invalid arguments
   1  Missing variables, placeholders, invalid URLs, invalid Stellar
      network/keys, key mismatches, or invalid arguments
 `.trim();
+
+/**
+ * Build the machine-readable result object. Contains only error codes and
+ * variable names — never secret values.
+ *
+ * @param {Object} params
+ * @param {string} params.target
+ * @param {boolean} params.strict
+ * @param {boolean} params.ok
+ * @param {Array<{ key: string, lines: number[] }>} params.duplicates
+ * @param {ValidationResult} params.result
+ * @returns {Object}
+ */
+export function buildJsonResult({ target, strict, ok, duplicates, result }) {
+  /** @type {Array<{ code: string, variables: string[] }>} */
+  const errors = [];
+  if (result.missing.length > 0) {
+    errors.push({ code: 'MISSING', variables: result.missing });
+  }
+  if (result.placeholder.length > 0) {
+    errors.push({ code: 'PLACEHOLDER', variables: result.placeholder });
+  }
+  if (result.invalidUrl.length > 0) {
+    errors.push({ code: 'INVALID_URL', variables: result.invalidUrl });
+  }
+  if (result.testnet.length > 0) {
+    errors.push({ code: 'TESTNET_NOT_ALLOWED', variables: result.testnet });
+  }
+  if (result.insecureUrl.length > 0) {
+    errors.push({ code: 'INSECURE_ENDPOINT', variables: result.insecureUrl });
+  }
+  return {
+    target,
+    strict,
+    ok,
+    errors,
+    duplicates: duplicates.map(({ key, lines }) => ({ key, lines })),
+  };
+}
 
 /**
  * Run the CLI. Exported so it can be stubbed in tests.
@@ -487,7 +627,7 @@ export function run(argv = process.argv.slice(2), cwd = process.cwd()) {
     console.error(`check-env: ${error.message}`);
     return 1;
   }
-  const { target, envFile, help } = options;
+  const { target, envFile, help, json, strict } = options;
 
   if (help) {
     console.log(HELP_TEXT);
@@ -496,20 +636,48 @@ export function run(argv = process.argv.slice(2), cwd = process.cwd()) {
 
   const validTargets = Object.keys(TARGETS);
   if (!validTargets.includes(target)) {
-    console.error(
-      `check-env: unknown target "${target}". Valid targets: ${validTargets.join(', ')}`
-    );
+    if (json) {
+      console.log(
+        JSON.stringify({
+          target,
+          strict,
+          ok: false,
+          errors: [{ code: 'INVALID_TARGET', variables: [] }],
+          duplicates: [],
+        })
+      );
+    } else {
+      console.error(
+        `check-env: unknown target "${target}". Valid targets: ${validTargets.join(', ')}`
+      );
+    }
     return 1;
   }
 
   const resolvedEnvFile = resolve(cwd, envFile);
-  const fileEnv = parseEnvFile(resolvedEnvFile);
+  const { env: fileEnv, occurrences } = parseEnvFileDetailed(resolvedEnvFile);
+  const duplicates = findDuplicateKeys(occurrences);
   const specs = TARGETS[target];
 
+  const result = validateEnv(specs, fileEnv, target, { strict });
+  const { ok, missing, placeholder, invalidUrl, testnet, insecureUrl } = result;
   const { ok, missing, placeholder, invalidUrl, invalidNetwork, invalidKey, keyMismatch } =
     validateEnv(specs, fileEnv, target);
 
   const targetLabel = target.toUpperCase();
+
+  if (json) {
+    console.log(JSON.stringify(buildJsonResult({ target, strict, ok, duplicates, result })));
+    return ok ? 0 : 1;
+  }
+
+  if (duplicates.length > 0) {
+    console.error(`⚠️   check-env [${targetLabel}]: duplicate keys in ${envFile}\n`);
+    for (const { key, lines } of duplicates) {
+      console.error(`  • ${key} assigned on lines ${lines.join(', ')} (last assignment wins)`);
+    }
+    console.error('');
+  }
 
   if (ok) {
     console.log(`✅  check-env [${targetLabel}]: all ${specs.length} required variables are set`);
@@ -554,6 +722,10 @@ export function run(argv = process.argv.slice(2), cwd = process.cwd()) {
     console.error('');
   }
 
+  if (testnet.length > 0) {
+    console.error(`Testnet configuration rejected in strict mainnet mode:`);
+    for (const name of testnet) {
+      console.error(`  • ${name} must not identify a testnet`);
   if (invalidNetwork.length > 0) {
     console.error(`Invalid STELLAR_NETWORK values (unsupported network):`);
     for (const name of invalidNetwork) {
@@ -565,6 +737,10 @@ export function run(argv = process.argv.slice(2), cwd = process.cwd()) {
     console.error('');
   }
 
+  if (insecureUrl.length > 0) {
+    console.error(`Insecure remote endpoints rejected in strict mainnet mode:`);
+    for (const name of insecureUrl) {
+      console.error(`  • ${name} must use https:// for non-local hosts`);
   if (invalidKey.length > 0) {
     console.error(`Invalid Stellar key/contract values (bad encoding or checksum):`);
     for (const name of invalidKey) {

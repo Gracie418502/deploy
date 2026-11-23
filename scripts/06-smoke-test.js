@@ -113,6 +113,26 @@ if (READY_TIMEOUT_MS <= 0) {
 }
 const READY_INTERVAL_MS = 2000;
 
+// Per-request deadline. A server that accepts connections but never responds
+// must not hang the smoke test, so every fetch is bounded by this timeout.
+const REQUEST_TIMEOUT_MS = Number(process.env.SMOKE_REQUEST_TIMEOUT_MS ?? 10000);
+
+/**
+ * fetch() wrapper that aborts after REQUEST_TIMEOUT_MS. Timeouts are surfaced
+ * as a clear error so callers (and the summary) report a bounded failure.
+ */
+async function fetchWithTimeout(url, options = {}) {
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (err) {
+    if (err?.name === "TimeoutError" || err?.name === "AbortError") {
+      throw new Error(`Request to ${url} timed out after ${REQUEST_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  }
 // Join a normalized base URL with an endpoint path using exactly one slash.
 function url(path) {
   return `${BASE}/${String(path).replace(/^\/+/, "")}`;
@@ -155,6 +175,7 @@ async function check(label, fn) {
 }
 
 async function get(path, headers = {}) {
+  const res = await fetchWithTimeout(`${BASE}${path}`, { headers });
   const res = await fetch(url(path), { headers });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
@@ -177,6 +198,7 @@ async function waitForBackend() {
   let lastErr;
   while (Date.now() < deadline) {
     try {
+      const res = await fetchWithTimeout(`${BASE}/health`);
       const res = await fetch(url("/health"));
       if (res.ok) return;
       lastErr = new Error(`HTTP ${res.status}`);
@@ -286,6 +308,7 @@ await check("x402 paywall blocks unauthenticated access", async () => {
   if (!sampleResourceId) {
     throw new Error("Cannot test paywall: no real resource ID available from catalog");
   }
+  const res = await fetchWithTimeout(`${BASE}/resources/${encodeURIComponent(sampleResourceId)}`, {
   const res = await fetch(url(`/resources/${encodeURIComponent(sampleResourceId)}`), {
     redirect: "manual",
   });
@@ -296,11 +319,13 @@ await check("x402 paywall blocks unauthenticated access", async () => {
 
 // Admin stats — verify unauthenticated access is rejected AND authenticated access works
 await check("Admin stats endpoint protected", async () => {
+  const unauthRes = await fetchWithTimeout(`${BASE}/admin/stats`);
   const unauthRes = await fetch(url("/admin/stats"), { redirect: "manual" });
   if (unauthRes.status !== 401 && unauthRes.status !== 403) {
     throw new Error(`Expected 401/403 without X-Admin-Key, got ${unauthRes.status}`);
   }
 
+  const badKeyRes = await fetchWithTimeout(`${BASE}/admin/stats`, {
   const badKeyRes = await fetch(url("/admin/stats"), {
     headers: { "X-Admin-Key": `${ADMIN_KEY}-invalid` },
     redirect: "manual",
@@ -309,6 +334,7 @@ await check("Admin stats endpoint protected", async () => {
     throw new Error(`Expected 401/403 with invalid X-Admin-Key, got ${badKeyRes.status}`);
   }
 
+  const res = await fetchWithTimeout(`${BASE}/admin/stats`, {
   // Authenticated request: never follow redirects automatically. If the server
   // redirects cross-origin, fail without re-sending X-Admin-Key to that origin.
   const res = await fetch(url("/admin/stats"), {
@@ -343,6 +369,7 @@ await check("Admin stats endpoint protected", async () => {
 // fetch the JSON spec and assert its content signature.
 const OPENAPI_PATHS = ["/docs/json", "/openapi.json", "/docs-json"];
 await check("OpenAPI docs served", async () => {
+  const res = await fetchWithTimeout(`${BASE}/docs`);
   const attempts = [];
   for (const path of OPENAPI_PATHS) {
     const res = await fetch(`${BASE}${path}`, {
