@@ -132,6 +132,26 @@ Each run writes two objects under `s3://<bucket>/backups/`:
   - `components` — per-component SHA-256 checksums recorded before encryption: `database.sql.gz`, `tables.txt` and each file under `contracts/`.
   - `postgres` — `serverVersion` (from `SHOW server_version`) and `pgDumpVersion` (from `pg_dump --version`).
 
+### Archive component allowlist
+
+`restore.sh` validates the archive's top-level contents against an allowlist before restoring anything. The archive must contain exactly these **required** top-level components:
+
+| Component | Kind | Purpose |
+| --- | --- | --- |
+| `database.sql.gz` | required file | Gzipped `pg_dump` output replayed into the target |
+| `tables.txt` | required file | Table list used for verification |
+| `contracts/` | required directory | Soroban contract state snapshots (may be empty when no contracts are configured) |
+| `manifest.json` | required file | Manifest copy embedded in the archive (must match the downloaded manifest) |
+
+The following **optional metadata** files are also allowed at the top level:
+
+| Component | Kind | Purpose |
+| --- | --- | --- |
+| `backup-info.txt` | optional file | Human-readable summary written by `backup.sh` (timestamp, versions, component list) |
+| `checksums.sha256` | optional file | Plain-text checksum listing for manual inspection |
+
+Any other top-level entry — an unknown file, an unexpected directory, or any member with the executable bit set — is treated as unexplained content. `restore.sh` fails closed: it aborts with a non-zero exit code (2) and a clear error listing the offending entries **before** decrypting or touching the target database. If a required component is missing, restore also aborts. To restore an archive that legitimately needs additional components, update the allowlist in `restore.sh` and this document in the same change; do not bypass the check.
+
 ### Manifest schema and compatibility policy
 
 The manifest declares a `schemaVersion`. `restore.sh` validates the manifest before touching the target database: required fields must be present and correctly typed, and the `schemaVersion` must be one it supports (currently `1`). Unsupported or newer schema versions are rejected with a clear error before any download or restore work begins, so an old `restore.sh` never misinterprets a newer manifest.
@@ -486,10 +506,13 @@ If the target is unreachable or the role lacks a required permission, the script
    ```bash
    ./scripts/restore.sh --backup soroban-backup-<timestamp> --database-url "$DATABASE_URL"
    ```
+   The script downloads the manifest and archive, validates the manifest schema version and required fields, verifies the archive SHA-256, decrypts, then checks the archive's top-level contents against the component allowlist (see section 2, "Archive component allowlist"): all required components (`database.sql.gz`, `tables.txt`, `contracts/`, `manifest.json`) must be present, only the documented optional metadata files may accompany them, and any other entry or executable member aborts the restore before anything is applied. It then verifies each component checksum from `components` against the decrypted files before replaying the dump in a single transaction (a failed restore changes nothing). Objects in the target that are not in the backup are left in place. If the manifest's `postgres` versions are incompatible with the target server, the script warns (or aborts with `--verify-only`) before applying anything.
    The script first runs the preflight checks described in section 7.1.1 (target connectivity, required permissions, and PostgreSQL version compatibility) and aborts early with a clear error if they fail — before downloading or decrypting anything, so no decrypted staging artifacts are created. Once preflight passes, it downloads the manifest and archive, validates the manifest schema version and required fields, verifies the archive SHA-256, decrypts, then verifies each component checksum from `components` against the decrypted files before replaying the dump in a single transaction (a failed restore changes nothing). Objects in the target that are not in the backup are left in place. If the manifest's `postgres` versions are incompatible with the target server, the script warns (or aborts with `--verify-only`) before applying anything. The work directory is cleaned up by a trap on every exit path unless `--keep-work-dir` is given.
    The script downloads the manifest and archive, validates the manifest schema version and required fields, verifies the archive SHA-256, decrypts, then validates the decrypted tarball before extraction: member count and total uncompressed size must stay within the configured budgets, and no two members may normalize to the same path (see section 2). Only after these checks pass does it extract, verify each component checksum from `components` against the decrypted files, and replay the dump in a single transaction (a failed restore changes nothing). Objects in the target that are not in the backup are left in place. If the manifest's `postgres` versions are incompatible with the target server, the script warns (or aborts with `--verify-only`) before applying anything.
 
    **Ownership and privileges are not restored.** `pg_dump` (as used by `backup.sh`) does not include `GRANT`/`REVOKE` statements or object ownership, so a restored database has tables owned by the restoring role and no privileges for the application role. Re-apply the application role's grants after every restore (see 7.2.1).
+
+   Before any destructive SQL is applied, `restore.sh` runs two pre-flight checks against the target (see sections 7.5 and 7.6): a PostgreSQL **extension inventory** comparison and a **lock/statement timeout** policy. Both produce actionable diagnostics and abort the restore before the transaction starts when they fail.
 
 #### 7.2.1 Post-restore ownership and grant checks
 
@@ -541,6 +564,8 @@ After restore, verify the following:
 - [ ] `restore.sh` finished with `restore complete` (exit code 0).
 - [ ] Row counts for critical tables look plausible (`--verify-only` logs counts for every table).
 - [ ] The application role can access required tables: `--verify-grants --app-db-role "$APP_DB_ROLE"` reports no missing privileges (see 7.2.1), and the role has no superuser rights.
+- [ ] Critical-table counts are within the expected counts/bounds recorded in the backup (see section 7.7); the restore fails verification otherwise.
+- [ ] The sanitized audit report (section 7.8) was produced and, in CI, uploaded as an artifact.
 - [ ] The application's `/health` endpoint reports healthy.
 - [ ] Smoke tests pass (`BACKEND_URL=... npm run test:smoke`).
 - [ ] No errors in application logs for 15 minutes post-restore.
@@ -548,12 +573,71 @@ After restore, verify the following:
 
 ### 7.4 Rollback
 
+If the restore fails, `restore.sh` rolls its transaction back and exits non-zero (2 = download/manifest validation/checksum/archive allowlist, 3 = decryption or component checksum mismatch, 4 = restore, 5 = verification). Fix the cause and re-run, or re-attempt with an earlier backup. If the failure is an unsupported manifest `schemaVersion`, use a `restore.sh` from the matching or newer release. If the failure is an archive allowlist violation (unexpected top-level entry, executable member, or missing required component), do not restore that archive: treat it as suspect, preserve it for investigation, and restore an earlier verified backup. Document the failure and notify the on-call engineer.
 If the restore fails, `restore.sh` rolls its transaction back and exits non-zero (2 = download/manifest validation/checksum, 3 = decryption or component checksum mismatch, 4 = restore, 5 = verification). Fix the cause and re-run, or re-attempt with an earlier backup. If the failure is an unsupported manifest `schemaVersion`, use a `restore.sh` from the matching or newer release. If preflight fails (unreachable target or missing permissions), fix connectivity or grant the required permissions and re-run; nothing was downloaded or decrypted, so there is no staging state to clean up. Document the failure and notify the on-call engineer.
 If the restore fails, `restore.sh` rolls its transaction back and exits non-zero (2 = download/manifest validation/checksum or archive validation failure such as an exceeded member/size budget or duplicate member paths, 3 = decryption or component checksum mismatch, 4 = restore, 5 = verification). Fix the cause and re-run, or re-attempt with an earlier backup. If the failure is an unsupported manifest `schemaVersion`, use a `restore.sh` from the matching or newer release. Document the failure and notify the on-call engineer.
 
+### 7.5 Pre-flight: PostgreSQL extension check
+
+Before applying any SQL, `restore.sh` inventories the extensions the backup requires and compares them with what the target can provide:
+
+- **Required extensions** are read from the backup (the `extensions` list recorded in the manifest, falling back to `CREATE EXTENSION` statements in the dump). If neither is available, the check is skipped with a warning.
+- **Availability** is checked against `pg_available_extensions` on the target.
+- **Permissions** are checked by confirming the restore role can create extensions (`rolsuper` or `CREATEROLE`/`CREATE` on the database), since `CREATE EXTENSION` runs as part of the restore.
+
+Diagnostics list each missing or uncreatable extension by name with the reason (not available on the target, or insufficient privileges) and the suggested remedy (install the `postgresql-<major>-<extension>` package, enable it on the managed provider, or restore with a role that can create extensions). Any missing extension aborts the restore **before** the transaction begins, so no destructive SQL is applied. Set `RESTORE_SKIP_EXTENSION_CHECK=1` only when you have verified the target manually.
+
+### 7.6 Pre-flight: lock and statement timeout policy
+
+To keep an unattended restore from waiting indefinitely on a conflicting session, `restore.sh` sets a bounded timeout policy on its restore session:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `RESTORE_LOCK_TIMEOUT` | `30s` | `lock_timeout` for the restore session; a lock wait longer than this fails the statement |
+| `RESTORE_STATEMENT_TIMEOUT` | `0` (disabled) | `statement_timeout` for the restore session; `0` disables it so long `COPY`/index builds are not killed |
+| `RESTORE_LOCK_RETRY_ATTEMPTS` | `3` | Attempts to acquire the lock before giving up |
+| `RESTORE_LOCK_RETRY_DELAY_SECONDS` | `10` | Delay between lock-acquisition attempts |
+
+Values use PostgreSQL timeout syntax (`ms`, `s`, `min`). When a lock cannot be acquired within the policy, the restore aborts with a diagnostic naming the blocking session (from `pg_stat_activity`/`pg_locks`) so the operator can terminate it and re-run. The policy is applied with `SET` on the restore session only and does not change server-wide settings.
+
+### 7.7 Critical-table row-count verification
+
+`backup.sh` records expected row counts for a configurable list of critical tables in the manifest (`criticalTables`), so a restore can catch missing critical data even when every expected table name exists:
+
+- **Configuring the list:** set `BACKUP_CRITICAL_TABLES` to a comma-separated list of tables, optionally with bounds, e.g. `users,transactions:min=1000,ledger_entries:min=1:max=10000000`. A bare table name records the exact count at backup time; `min=`/`max=` record bounds instead.
+- **Recorded at backup time:** for each entry, `backup.sh` records the table name, the observed count and the expected count or bounds in the manifest's `criticalTables` array.
+- **Verified at restore time:** after the dump is replayed (and in `--verify-only` mode), `restore.sh` counts each listed table on the target and compares it with the recorded expectation. A count outside the recorded bounds, or a missing table, fails verification with exit code 5 and a per-table diagnostic (expected vs. actual).
+- **Overriding at restore time:** pass `--critical-tables <list>` (same syntax) to check a different list, or `--skip-critical-tables` to bypass the check when the manifest has no recorded list.
+
+### 7.8 Sanitized restore audit report
+
+Every `restore.sh` run writes a sanitized JSON audit report (default `restore-audit-<UTC timestamp>.json` in the working directory; override with `--audit-report <path>`). It records:
+
+- `backupId` — the backup identifier restored.
+- `target` — the target identity: host, port, database and role (never the password; connection URLs are redacted).
+- `timestamps` — `startedAt`, `finishedAt` and `durationSeconds`.
+- `components` — per-component outcome (manifest, archive checksum, decryption, component checksums, dump replay) with `status` and detail.
+- `verification` — results of the extension check, lock/timeout policy, PostgreSQL version compatibility and critical-table row-count verification.
+- `result` — overall `success`/`failure` and the exit code.
+
+The report never contains connection passwords, encryption keys or other secrets; connection strings are reduced to host/port/database/role. It is written even when the restore fails, so it can be attached to an incident.
+
+In CI, the `verify-restore` job uploads the report as an artifact:
+
+```yaml
+- uses: actions/upload-artifact@v4
+  if: always()
+  with:
+    name: restore-audit
+    path: restore-audit-*.json
+    retention-days: 30
+```
+
+Locally, upload it manually if needed: `aws s3 cp restore-audit-*.json s3://<bucket>/restore-audits/`.
+
 ## 8. Testing
 
-- Restores are verified automatically **weekly** against staging by the `verify-restore` job.
+- Restores are verified automatically **weekly** against staging by the `verify-restore` job, which also uploads the sanitized audit report (section 7.8) as an artifact.
 - `backup.sh --dry-run` prints the planned components (database dump, contract snapshots), the destination bucket/prefix and the retention actions that would run, then exits. It performs **no** dump, upload or delete, and never prints credentials, keys or connection strings (they are redacted). Use it to validate configuration changes safely.
 - `restore.sh --plan` is exercised in the verification workflow to confirm a backup's metadata and archive safety without touching a database.
 - The verification workflow also covers a successful upload followed by a failed retention cleanup, asserting `upload_status=success` and `retention_status=failed` are reported separately.

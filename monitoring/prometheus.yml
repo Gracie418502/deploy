@@ -17,6 +17,10 @@ alerting:
 # Mounted at this path by docker-compose.yml.
 rule_files:
   - '/etc/prometheus/alert-rules.yml'
+  # Synthetic alert-delivery drill rules (see monitoring/README.md). These are
+  # gated on the `drill` external label so they never fire in normal operation
+  # and never touch the real incident thresholds in alert-rules.yml.
+  - '/etc/prometheus/drill-rules.yml'
 
 # Job names matter: monitoring/alert-rules.yml selects on job="backend" and
 # job="database".
@@ -109,6 +113,21 @@ scrape_configs:
         labels:
           service: 'kube-state-metrics'
           tier: 'infrastructure'
+
+  # Synthetic alert-delivery drill source. The drill procedure toggles the
+  # `synthetic_drill_active` metric (value 1) here to exercise the full
+  # Prometheus -> Alertmanager -> receiver pipeline without modifying any real
+  # alert thresholds. The drill rules in drill-rules.yml additionally require
+  # the `drill` external label (PROMETHEUS_DRILL=true), so this job is inert
+  # during normal operation. See monitoring/README.md for the procedure.
+  - job_name: 'drill'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['drill-exporter:9101']
+        labels:
+          service: 'synthetic-drill'
+          tier: 'monitoring'
+          drill: 'true'
 
   # Backup metrics (soroban_backup_*) are written by scripts/backup.sh to a
   # node_exporter textfile collector. Uncomment when backups run on a host with

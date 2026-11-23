@@ -425,6 +425,27 @@ groups:
           description: "The backend is consuming its 99.9% availability error budget at more than 6x the sustainable rate over both the 6h and 30m windows. At this rate the 30-day budget would be exhausted in under ~5 days."
           runbook_url: "https://github.com/example/soroban-backend/blob/main/docs/runbooks/error-budget-burn.md"
 
+  - name: drill-synthetic
+    rules:
+      # Synthetic alert used by the alert-delivery drill (see
+      # docs/runbooks/alert-delivery-drill.md). It only fires when the
+      # operator-controlled `synthetic_drill_active` metric is set to 1, and
+      # carries severity="drill" / drill="true" so it never matches the
+      # production critical/warning routes. No production thresholds are
+      # touched by this group.
+      - alert: SyntheticDrillAlert
+        expr: |
+          synthetic_drill_active{drill="true"} == 1
+        for: 0m
+        labels:
+          severity: drill
+          drill: "true"
+          team: platform
+        annotations:
+          summary: "Synthetic alert-delivery drill is active"
+          description: "This is a synthetic drill alert triggered by synthetic_drill_active{drill=\"true\"} == 1. It validates the alert delivery and resolution pipeline and is not a real incident."
+          runbook_url: "https://github.com/example/soroban-backend/blob/main/docs/runbooks/alert-delivery-drill.md"
+
   - name: metrics-instrumentation
     rules:
       - alert: DatabaseConnectionPoolMetricsMissing

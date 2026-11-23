@@ -27,6 +27,11 @@ ADMIN_PUBLIC_KEY=G...   `# optional; defaults to the deployer` \
 CONTRACTS_WASM_DIR=../contracts/target/wasm32-unknown-unknown/release \
 npm run deploy:contracts -- --network testnet
 
+# Same, with explicit fee ceilings and a bounded confirmation deadline
+STELLAR_SECRET_KEY=S... \
+CONTRACTS_WASM_DIR=../contracts/target/wasm32-unknown-unknown/release \
+npm run deploy:contracts -- --network testnet \
+  --max-fee 0.5 --max-total-fee 5 --confirm-timeout 180000
 # Preview what would happen without touching the network (no signing, no
 # submission, secrets masked in the output):
 npm run deploy:contracts -- --network testnet --plan
@@ -44,6 +49,78 @@ present), deploys `vault-registry`, `access-lease` and `subscription`,
 initialises each with `init(admin)`, and writes the resulting contract IDs to
 `contract-ids.env`. Mainnet requires typing a confirmation, or `--yes` in CI.
 
+### Fee ceilings
+
+Before signing anything, the script simulates each transaction and compares the
+estimated fee against operator-supplied ceilings:
+
+| Flag | Env equivalent | Meaning | Default |
+| --- | --- | --- | --- |
+| `--max-fee <XLM>` | `MAX_FEE_XLM` | Maximum fee for a single transaction | none (unbounded) |
+| `--max-total-fee <XLM>` | `MAX_TOTAL_FEE_XLM` | Maximum cumulative fee across the whole deploy run | none (unbounded) |
+
+```bash
+# Per-transaction ceiling only
+npm run deploy:contracts -- --network testnet --max-fee 0.5
+
+# Total budget for the run, supplied via the environment
+MAX_TOTAL_FEE_XLM=5 npm run deploy:contracts -- --network testnet
+```
+
+If a simulated fee exceeds either ceiling, the script **stops before signing**
+and reports the estimated cost, e.g.:
+
+```
+Fee ceiling exceeded: estimated 0.7341 XLM for transaction "upload vault-registry"
+exceeds --max-fee 0.5 XLM. Nothing was signed.
+```
+
+The total ceiling is checked against the running sum of simulated fees, so a
+run that stays under the per-transaction limit can still be halted once the
+cumulative estimate would exceed `--max-total-fee`.
+
+### RPC network identity verification
+
+Before signing, the script queries the configured `SOROBAN_RPC_URL` for its
+reported network identity (network passphrase) and compares it with the
+passphrase implied by `--network` (and the selected network configuration). If
+they disagree — for example a mainnet RPC URL passed with `--network testnet` —
+the run fails **before any transaction is submitted**:
+
+```
+RPC network mismatch: endpoint reports "Public Global Stellar Network ; September 2015"
+but --network testnet expects "Test SDF Network ; September 2015".
+Refusing to sign. Check SOROBAN_RPC_URL.
+```
+
+This guards against accidentally signing testnet transactions against a mainnet
+endpoint (or vice versa) when `SOROBAN_RPC_URL` is overridden.
+
+### Confirmation deadline
+
+Confirmation polling is bounded by an overall deadline rather than a fixed
+number of attempts:
+
+| Flag | Env equivalent | Meaning | Default |
+| --- | --- | --- | --- |
+| `--confirm-timeout <ms>` | `CONFIRM_TIMEOUT_MS` | Overall deadline for each confirmation loop | 120000 (2 minutes) |
+
+```bash
+# Give slow networks more time
+npm run deploy:contracts -- --network testnet --confirm-timeout 300000
+```
+
+If a transaction is still pending when the deadline elapses, the script stops
+polling (so CI cannot hang indefinitely) and exits with an error that includes
+the **transaction hash**, so the transaction can be reconciled later:
+
+```
+Timed out after 120000ms waiting for confirmation of transaction <tx-hash>.
+The transaction may still be pending; check it on the explorer before retrying.
+```
+
+Re-running the deploy after a timeout is safe to inspect first: look up the
+reported hash to see whether the transaction landed before deploying again.
 ### Build manifest and checksum validation
 
 Pass `--manifest <path>` to validate every WASM artifact against expected
@@ -100,6 +177,104 @@ Kubernetes ConfigMap. Restart the backend afterwards to pick up the change.
 
 ---
 
+## Contract TTL inspection and extension
+
+Soroban contract **instances** and their **WASM code** entries are stored in
+ledger entries that expire unless their time-to-live (TTL) is extended. If an
+entry expires, calls to the contract fail until it is restored. After every
+deploy the script therefore inspects the remaining TTL of each contract's
+instance entry and code entry and records the observed ledger values (current
+ledger sequence and the live-until ledger of each entry) in its output and in
+`contract-ids.env`-adjacent deploy logs.
+
+### Configuring the minimum thresholds
+
+The script compares the observed TTL against configurable minimums and warns
+(or fails, with `--strict-ttl`) when an entry is below them:
+
+| Option | Env var | Meaning |
+| --- | --- | --- |
+| `--min-instance-ttl <ledgers>` | `MIN_INSTANCE_TTL_LEDGERS` | Minimum remaining ledgers for contract instance entries |
+| `--min-code-ttl <ledgers>` | `MIN_CODE_TTL_LEDGERS` | Minimum remaining ledgers for contract code (WASM) entries |
+
+```bash
+# Warn if either entry has less than ~30 days of TTL left
+# (Stellar ledgers close roughly every 5 seconds, so 30 days ≈ 518,400 ledgers)
+MIN_INSTANCE_TTL_LEDGERS=518400 MIN_CODE_TTL_LEDGERS=518400 \
+npm run deploy:contracts -- --network testnet
+
+# Or pass the thresholds explicitly; --strict-ttl turns warnings into a failure
+npm run deploy:contracts -- --network testnet \
+  --min-instance-ttl 518400 --min-code-ttl 518400 --strict-ttl
+```
+
+### Interpreting the results
+
+- **OK** — remaining TTL is at or above the configured minimum for both the
+  instance and code entries.
+- **WARN** — an entry is below the minimum. The deploy still succeeds, but
+  extend the TTL before it expires (see below).
+- **FAIL** — with `--strict-ttl`, a below-minimum entry aborts the run with a
+  non-zero exit code. Use this in CI so a deploy that leaves contracts close to
+  expiry is caught immediately.
+
+If the script cannot read an entry's TTL (e.g. the contract ID does not exist
+on the target network), treat it as a failure and re-check the contract IDs.
+
+### Extending TTL
+
+Extend both the **instance** entry and the **code** entry for every deployed
+contract. Using the Stellar CLI:
+
+```bash
+# Extend the contract instance entry
+stellar contract extend \
+  --id "$STELLAR_CONTRACT_VAULT_REGISTRY" \
+  --source <admin-secret-key> \
+  --network testnet \
+  --ledger 518400
+
+# Extend the contract code (WASM) entry — pass the WASM hash of the deployed code
+stellar contract extend \
+  --id "$STELLAR_CONTRACT_VAULT_REGISTRY" \
+  --source <admin-secret-key> \
+  --network testnet \
+  --wasm-hash <wasm-hash> \
+  --ledger 518400
+```
+
+Repeat for `access-lease` and `subscription`. `--ledger` is the number of
+ledgers to extend the entry's TTL by (relative to the current ledger), so pick a
+value that comfortably exceeds your minimum threshold.
+
+From the SDK, use `extendFootprintTtl` to extend the entries touched by a
+simulated invocation, or `extendContractInstance` to extend a contract's
+instance entry directly:
+
+```js
+const { SorobanRpc, TransactionBuilder, Networks, Operation } = require('@stellar/stellar-sdk');
+
+// Extend the instance entry of a deployed contract
+const op = Operation.extendContractInstance({
+  contract: contractId,
+  extendTo: currentLedger + 518400,
+});
+
+// Or extend the footprint (instance + code) of a simulated invocation
+const extendOp = Operation.extendFootprintTtl({ extendTo: currentLedger + 518400 });
+```
+
+After extending, re-run the TTL inspection (or the deploy script with
+`--dry-run`) to confirm the new live-until ledger values are above the
+configured minimums, and record them in the deployment notes.
+
+> **Testnet resets:** a Stellar testnet reset wipes all ledger state, including
+> contracts and their TTLs. Follow the
+> [testnet reset recovery runbook](./testnet-reset-recovery.md) to re-fund
+> accounts, redeploy contracts and reconcile the backend catalog.
+
+---
+
 ## Updating the backend ConfigMap after a contract deploy
 
 The backend ConfigMap (`k8s/configmap.yaml`) tracks the contract IDs in Git so
@@ -148,6 +323,15 @@ While the quickstart steps below focus on **Testnet**, deploying to **Stellar Ma
   and matches the expected public key.
 - **Balance check** — confirms the deployer account holds enough XLM to cover
   upload and deployment fees.
+- **Fee ceiling check** — simulates each transaction and refuses to sign if the
+  estimated fee exceeds `--max-fee` / `MAX_FEE_XLM` (per transaction) or
+  `--max-total-fee` / `MAX_TOTAL_FEE_XLM` (cumulative), reporting the estimate.
+- **RPC network identity check** — compares the network passphrase reported by
+  `SOROBAN_RPC_URL` with the selected `--network` and aborts before submission
+  on a mismatch.
+- **Confirmation deadline** — bounds confirmation polling by
+  `--confirm-timeout` / `CONFIRM_TIMEOUT_MS` (default 120000 ms) and reports the
+  transaction hash if the deadline is reached.
 - **WASM hash check** — builds the contracts and compares the resulting WASM hashes
   against the recorded hashes to detect unintended changes. Pass
   `--manifest build-manifest.json` to enforce the audited SHA-256 checksums; a
@@ -355,5 +539,8 @@ If the contract `admin` key or the backend signing key (`BACKEND_SECRET` / `STEL
 | `account not found` | Fund the account with Friendbot first |
 | `Error: wasm too large` | Run with `--release` flag |
 | `insufficient balance` | Fund deployer wallet — needs XLM for fees |
+| `Fee ceiling exceeded` | Raise `--max-fee` / `--max-total-fee` (or the env equivalents) after reviewing the reported estimate |
+| `RPC network mismatch` | Point `SOROBAN_RPC_URL` at an endpoint for the selected `--network` |
+| `Timed out ... waiting for confirmation` | Look up the reported transaction hash; raise `--confirm-timeout` / `CONFIRM_TIMEOUT_MS` if the network is slow |
 | `contract already exists` | Use `--wasm-hash` flag to reuse existing upload |
 | `Error: HostError: Value(InvalidInput)` | Check argument types match contract signature |

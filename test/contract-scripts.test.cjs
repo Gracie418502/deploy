@@ -132,6 +132,111 @@ test('deploy parseArgs understands --network, --wasm-dir, --yes, --dry-run', () 
   assert.throws(() => deploy.parseArgs(['--bogus']), /Unknown argument/);
 });
 
+test('deploy parseArgs accepts fee ceiling and timeout flags', () => {
+  const args = deploy.parseArgs([
+    '--max-fee',
+    '5000000',
+    '--max-tx-fee=1000000',
+    '--timeout',
+    '120',
+  ]);
+  assert.equal(args.maxFee, 5000000);
+  assert.equal(args.maxTxFee, 1000000);
+  assert.equal(args.timeout, 120);
+
+  // Invalid values are rejected.
+  assert.throws(() => deploy.parseArgs(['--max-fee', 'abc']), /--max-fee/);
+  assert.throws(() => deploy.parseArgs(['--max-fee', '-1']), /--max-fee/);
+  assert.throws(() => deploy.parseArgs(['--max-tx-fee', '0']), /--max-tx-fee/);
+  assert.throws(() => deploy.parseArgs(['--timeout', 'nope']), /--timeout/);
+  assert.throws(() => deploy.parseArgs(['--timeout', '0']), /--timeout/);
+});
+
+test('deploy submitTransaction aborts before signing when the fee exceeds the ceiling', async () => {
+  const kp = Keypair.random();
+  let signed = false;
+  let sent = false;
+
+  const mockServer = {
+    prepareTransaction: async () => ({
+      fee: '9000000', // 0.9 XLM, above the 0.5 XLM ceiling
+      sign: () => {
+        signed = true;
+      },
+    }),
+    sendTransaction: async () => {
+      sent = true;
+      return { status: 'PENDING', hash: 'should-not-send' };
+    },
+  };
+
+  await assert.rejects(
+    () =>
+      deploy.submitTransaction({
+        server: mockServer,
+        tx: {},
+        keypair: kp,
+        networkPassphrase: 'Test SDF Network ; September 2015',
+        dryRun: false,
+        label: 'fee-ceiling-tx',
+        maxTxFee: 5000000,
+      }),
+    /fee/i
+  );
+
+  assert.equal(signed, false);
+  assert.equal(sent, false);
+});
+
+test('deploy verifyNetworkIdentity rejects a mismatched RPC passphrase', async () => {
+  const server = {
+    getNetwork: async () => ({
+      passphrase: 'Public Global Stellar Network ; September 2015',
+      protocolVersion: 22,
+    }),
+  };
+
+  await assert.rejects(
+    () =>
+      deploy.verifyNetworkIdentity({
+        server,
+        networkPassphrase: 'Test SDF Network ; September 2015',
+        network: 'testnet',
+      }),
+    /network/i
+  );
+
+  // A matching passphrase resolves without throwing.
+  const okServer = {
+    getNetwork: async () => ({
+      passphrase: 'Test SDF Network ; September 2015',
+      protocolVersion: 22,
+    }),
+  };
+  await deploy.verifyNetworkIdentity({
+    server: okServer,
+    networkPassphrase: 'Test SDF Network ; September 2015',
+    network: 'testnet',
+  });
+});
+
+test('deploy pollTransaction surfaces the hash when the deadline elapses', async () => {
+  const server = {
+    getTransaction: async () => ({ status: 'NOT_FOUND' }),
+  };
+
+  await assert.rejects(
+    () =>
+      deploy.pollTransaction({
+        server,
+        hash: 'pendinghash456',
+        deadlineMs: 50,
+        intervalMs: 10,
+      }),
+    /pendinghash456/
+  );
+});
+
 test('deploy validateEnv resolves RPC, admin and wasm paths', () => {
   const kp = Keypair.random();
   const admin = Keypair.random().publicKey();
@@ -274,6 +379,117 @@ test('deployment resume rejects contract IDs from another network', () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('inspectContractTtl reports remaining TTL and warns below the minimum', async () => {
+  const { nativeToScVal } = require('@stellar/stellar-sdk');
+  const latestLedger = 1000;
+  const instanceLiveUntil = 1000 + 5000;
+  const codeLiveUntil = 1000 + 200;
+
+  const makeEntry = (liveUntilLedgerSeq) => ({
+    val: { value: { val: { value: { storage: [] } } } },
+    liveUntilLedgerSeq,
+  });
+
+  const server = {
+    getLatestLedger: async () => ({ sequence: latestLedger }),
+    getContractData: async () => makeEntry(instanceLiveUntil),
+    getContractCodeLedgerEntry: async () => makeEntry(codeLiveUntil),
+  };
+
+  const logs = [];
+  const warnings = [];
+  const result = await deploy.inspectContractTtl({
+    server,
+    contractId: VALID_ID,
+    contractName: 'test-contract',
+    minTtlLedgers: 1000,
+    hardFloorLedgers: 100,
+    log: (msg) => logs.push(msg),
+    warn: (msg) => warnings.push(msg),
+  });
+
+  assert.equal(result.latestLedger, latestLedger);
+  assert.equal(result.instance.liveUntilLedgerSeq, instanceLiveUntil);
+  assert.equal(result.instance.remaining, 5000);
+  assert.equal(result.code.liveUntilLedgerSeq, codeLiveUntil);
+  assert.equal(result.code.remaining, 200);
+
+  // Observed ledger values are logged.
+  const joined = logs.join('\n');
+  assert.match(joined, new RegExp(String(instanceLiveUntil)));
+  assert.match(joined, new RegExp(String(codeLiveUntil)));
+
+  // Code TTL is below the minimum but above the hard floor: warn, don't fail.
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /code/);
+  assert.match(warnings[0], /200/);
+});
+
+test('inspectContractTtl fails when TTL is below the hard floor', async () => {
+  const latestLedger = 2000;
+  const server = {
+    getLatestLedger: async () => ({ sequence: latestLedger }),
+    getContractData: async () => ({ liveUntilLedgerSeq: latestLedger + 10 }),
+    getContractCodeLedgerEntry: async () => ({ liveUntilLedgerSeq: latestLedger + 5000 }),
+  };
+
+  await assert.rejects(
+    () =>
+      deploy.inspectContractTtl({
+        server,
+        contractId: VALID_ID,
+        contractName: 'test-contract',
+        minTtlLedgers: 1000,
+        hardFloorLedgers: 100,
+        log: () => {},
+        warn: () => {},
+      }),
+    /below the hard floor/
+  );
+});
+
+test('inspectContractTtl treats missing ledger entries as expired', async () => {
+  const server = {
+    getLatestLedger: async () => ({ sequence: 500 }),
+    getContractData: async () => null,
+    getContractCodeLedgerEntry: async () => null,
+  };
+
+  await assert.rejects(
+    () =>
+      deploy.inspectContractTtl({
+        server,
+        contractId: VALID_ID,
+        contractName: 'test-contract',
+        minTtlLedgers: 1000,
+        hardFloorLedgers: 100,
+        log: () => {},
+        warn: () => {},
+      }),
+    /not found|expired/i
+  );
+});
+
+test('deployment record includes observed TTL values', () => {
+  const record = deploy.buildDeploymentRecord({
+    network: 'testnet',
+    contractName: 'vault-registry',
+    contractId: VALID_ID,
+    wasmHash: 'abc123',
+    ttl: {
+      latestLedger: 1000,
+      instance: { liveUntilLedgerSeq: 6000, remaining: 5000 },
+      code: { liveUntilLedgerSeq: 1200, remaining: 200 },
+    },
+  });
+
+  assert.equal(record.ttl.latestLedger, 1000);
+  assert.equal(record.ttl.instance.liveUntilLedgerSeq, 6000);
+  assert.equal(record.ttl.instance.remaining, 5000);
+  assert.equal(record.ttl.code.liveUntilLedgerSeq, 1200);
+  assert.equal(record.ttl.code.remaining, 200);
 });
 
 test('deploy parseArgs understands --manifest, --plan, --record and --lock', () => {

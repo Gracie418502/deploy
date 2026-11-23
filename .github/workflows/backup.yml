@@ -237,7 +237,30 @@ jobs:
           # exercises the deadline/retry behavior against object storage.
           BACKUP_STORAGE_TIMEOUT_SECONDS: ${{ vars.BACKUP_STORAGE_TIMEOUT_SECONDS || '60' }}
           BACKUP_STORAGE_MAX_RETRIES: ${{ vars.BACKUP_STORAGE_MAX_RETRIES || '3' }}
+          # Critical tables with expected row counts/bounds recorded from the
+          # backup, e.g. "accounts=1000-2000,transactions>=5000". Missing or
+          # out-of-bounds tables fail verification even when the table exists.
+          RESTORE_CRITICAL_TABLES: ${{ vars.RESTORE_CRITICAL_TABLES }}
+          # Extensions the target must provide before destructive SQL runs.
+          RESTORE_REQUIRED_EXTENSIONS: ${{ vars.RESTORE_REQUIRED_EXTENSIONS || 'pgcrypto' }}
+          # Bounded lock/statement policy so a conflicting session cannot leave
+          # an unattended restore waiting indefinitely.
+          RESTORE_LOCK_TIMEOUT: ${{ vars.RESTORE_LOCK_TIMEOUT || '30s' }}
+          RESTORE_STATEMENT_TIMEOUT: ${{ vars.RESTORE_STATEMENT_TIMEOUT || '15min' }}
+          # Sanitized audit report (no connection passwords) uploaded below.
+          RESTORE_AUDIT_REPORT: restore-audit/restore-audit.json
         run: bash scripts/restore.sh --verify-only
+
+      - name: Upload restore audit report
+        if: always() && steps.config.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-audit-${{ github.run_id }}
+          path: |
+            restore-audit/*.json
+            restore-audit/*.txt
+          if-no-files-found: warn
+          retention-days: 30
 
   backup-outcome-selftest:
     name: Backup Outcome Reporting Self-Test

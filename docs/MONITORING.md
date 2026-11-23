@@ -33,6 +33,7 @@ All configuration referenced here lives in the [`monitoring/`](../monitoring) di
   - [Email](#email)
   - [Slack](#slack)
 - [6. Verify the setup](#6-verify-the-setup)
+- [Alert-delivery drill](#alert-delivery-drill)
 - [Runbooks](#runbooks)
 - [Required metrics](#required-metrics)
 - [Troubleshooting](#troubleshooting)
@@ -276,10 +277,129 @@ Mount the referenced secret files into the Alertmanager container and keep them 
 
 1. Confirm Prometheus targets are up: **Prometheus → Status → Targets**.
 2. Confirm rules are loaded: **Prometheus → Status → Rules**.
-3. Trigger a test alert (e.g. temporarily lower a threshold) and confirm it reaches Alertmanager and the configured notification channel.
-4. Confirm the alert resolves and a resolved notification is delivered (if `send_resolved` is enabled).
+3. Run the controlled alert-delivery drill (see [Alert-delivery drill](#alert-delivery-drill)) to confirm alerts reach Alertmanager and the configured notification channel.
+4. Confirm the drill alert resolves and a resolved notification is delivered (if `send_resolved` is enabled).
+
+## Alert-delivery drill
+
+The drill sends a **synthetic** alert through the configured monitoring pipeline
+(Prometheus → Alertmanager → notification receiver) and captures evidence that
+both the firing and resolved notifications were delivered. It does **not**
+modify any real incident alert thresholds, alert rules, or production routes.
+
+### How it works
+
+- The drill alert is injected directly into Alertmanager via its HTTP API
+  (`POST /api/v2/alerts`) with a dedicated `drill="true"` label. It never
+  touches `monitoring/alert-rules.yml`, so production thresholds are untouched.
+- Alertmanager routes the drill alert to a dedicated `drill` receiver (a
+  separate route matching `drill="true"`), so real on-call channels are not
+  paged. Configure the drill receiver in `monitoring/alertmanager.yml` to point
+  at the channel you want to validate (e.g. a test Slack channel or mailbox).
+- The drill then resolves the alert by posting an `endsAt` in the past, and
+  captures the resolved notification.
+
+### Run the drill
+
+The automated drill lives in [`monitoring/drill/alert-delivery-drill.sh`](../monitoring/drill/alert-delivery-drill.sh).
+From the repository root:
+
+```bash
+# Defaults: Alertmanager at http://localhost:9093, evidence in monitoring/drill/evidence/
+./monitoring/drill/alert-delivery-drill.sh
+
+# Override the Alertmanager URL and evidence directory
+ALERTMANAGER_URL=http://alertmanager.example.com:9093 \
+  EVIDENCE_DIR=./drill-evidence \
+  ./monitoring/drill/alert-delivery-drill.sh
+```
+
+The script performs these steps:
+
+1. Posts a firing drill alert to Alertmanager:
+
+   ```bash
+   curl -sS -X POST "$ALERTMANAGER_URL/api/v2/alerts" \
+     -H 'Content-Type: application/json' \
+     -d '[{
+       "labels": {
+         "alertname": "DrillAlertDelivery",
+         "severity": "drill",
+         "drill": "true"
+       },
+       "annotations": {
+         "summary": "Synthetic alert-delivery drill",
+         "description": "Controlled drill; no production thresholds modified."
+       },
+       "startsAt": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
+     }]'
+   ```
+
+2. Confirms the alert is present in Alertmanager:
+
+   ```bash
+   curl -sS "$ALERTMANAGER_URL/api/v2/alerts?filter=drill%3D%22true%22"
+   ```
+
+3. Resolves the drill alert by re-posting it with `endsAt` in the past:
+
+   ```bash
+   curl -sS -X POST "$ALERTMANAGER_URL/api/v2/alerts" \
+     -H 'Content-Type: application/json' \
+     -d '[{
+       "labels": {
+         "alertname": "DrillAlertDelivery",
+         "severity": "drill",
+         "drill": "true"
+       },
+       "annotations": {
+         "summary": "Synthetic alert-delivery drill",
+         "description": "Controlled drill; no production thresholds modified."
+       },
+       "startsAt": "'"$(date -u -d '-5 minutes' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-5M +%Y-%m-%dT%H:%M:%SZ)"'",
+       "endsAt": "'"$(date -u -d '-1 minute' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-1M +%Y-%m-%dT%H:%M:%SZ)"'"
+     }]'
+   ```
+
+4. Writes the Alertmanager API responses (firing and resolved) to the evidence
+   directory.
+
+### Confirm delivery
+
+- Check the drill receiver (test Slack channel / mailbox) for the
+  `DrillAlertDelivery` firing notification and, after resolution, the resolved
+  notification.
+- Confirm the alert is gone from Alertmanager:
+
+  ```bash
+  curl -sS "$ALERTMANAGER_URL/api/v2/alerts?filter=drill%3D%22true%22"
+  ```
+
+  The response should be `[]` once the alert has resolved.
+
+### Evidence
+
+The drill stores evidence under `monitoring/drill/evidence/` (override with
+`EVIDENCE_DIR`). Each run writes timestamped files:
+
+- `drill-<timestamp>-firing.json` — Alertmanager response after posting the
+  firing alert.
+- `drill-<timestamp>-alerts.json` — Alertmanager state showing the active drill
+  alert.
+- `drill-<timestamp>-resolved.json` — Alertmanager response after resolving.
+- `drill-<timestamp>-summary.txt` — human-readable summary of the run.
+
+Attach the summary and the receiver screenshots/exports to the deployment
+verification record.
+
+> **Production safety:** the drill only injects a synthetic alert with the
+> `drill="true"` label and a dedicated drill route/receiver. It does not change
+> alert thresholds, alert rules, or production routing. If no drill receiver is
+> configured, the drill alert is routed by the default route — configure the
+> drill receiver before running the drill in production.
 
 ## Runbooks
+=======
 
 Every alert in [`monitoring/alert-rules.yml`](../monitoring/alert-rules.yml) links to an operational runbook via its `runbook_url` annotation. Runbooks live in [`docs/runbooks/`](./runbooks) — see the [runbook index](./runbooks/README.md) for the full list.
 
@@ -290,6 +410,7 @@ When you add or rename an alert, add a matching runbook under `docs/runbooks/` a
 - **No metrics in Prometheus:** check the scrape target, network reachability, and that the backend `/metrics` endpoint responds.
 - **Rules not loading:** validate the YAML and confirm the rule file is mounted at the path in `rule_files`.
 - **Alerts not delivered:** check Alertmanager logs and confirm receiver credentials/secret files are correct.
+- **Drill alert not delivered:** confirm the `drill` route/receiver exists in `monitoring/alertmanager.yml` and that the Alertmanager URL passed to the drill script is reachable.
 - **Dashboard empty:** confirm the Grafana data source points at the correct Prometheus instance.
         channel: "#alerts"
         send_resolved: true
@@ -313,6 +434,10 @@ kubectl apply -f monitoring/prometheusrule.yaml
 
 - Alert rules: open **Status → Rules** and confirm the project alert group is
   loaded.
+- Alert delivery: run the controlled drill
+  (`./monitoring/drill/alert-delivery-drill.sh`) against the port-forwarded
+  Alertmanager and confirm firing and resolved delivery to the drill receiver.
+  Evidence is written to `monitoring/drill/evidence/`.
 - Grafana: port-forward the Grafana service and log in with the admin password.
 
   ```bash
@@ -322,7 +447,7 @@ kubectl apply -f monitoring/prometheusrule.yaml
 
 1. Confirm Prometheus is scraping the backend: **Prometheus → Status → Targets** should show the `backend` job as `UP`.
 2. Confirm the required metrics are present (see [Required metrics](#required-metrics)).
-3. Trigger a test alert (e.g. stop the backend) and confirm it reaches your notification channel.
+3. Run the controlled alert-delivery drill (see [Alert-delivery drill](#alert-delivery-drill)) and confirm the synthetic alert fires and resolves through your notification channel without changing production thresholds.
 
 ## Required metrics
 
@@ -420,7 +545,7 @@ Route alerts to the receivers under `route:` and reload Alertmanager (or restart
 1. Confirm Prometheus targets are up: **Prometheus → Status → Targets**.
 2. Confirm rules are loaded: **Prometheus → Status → Rules**.
 3. Confirm Grafana renders the dashboard panels with live data.
-4. Trigger a test alert (e.g. temporarily lower a threshold in `alert-rules.yml`) and confirm it reaches the configured receiver.
+4. Run the controlled alert-delivery drill (see [Alert-delivery drill](#alert-delivery-drill)) and confirm the synthetic alert fires and resolves through the configured receiver. Do not lower production thresholds to test delivery.
 
 ## Notes
 
