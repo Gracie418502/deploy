@@ -58,6 +58,32 @@ Optional tuning variables for network calls (both `backup.sh` and `restore.sh`):
 | `BACKUP_STORAGE_TIMEOUT_SECONDS` | `60` | Per-attempt deadline for each object-storage (S3) call |
 | `BACKUP_RETRY_MAX_ATTEMPTS` | `4` | Total attempts (initial try + retries) for transient failures |
 | `BACKUP_RETRY_BASE_DELAY_SECONDS` | `2` | Base delay for exponential backoff between attempts (capped) |
+| `BACKUP_REQUIRED_FREE_BYTES` | `1073741824` (1 GiB) | Minimum free space required in the staging work directory before a database dump starts |
+
+### Concurrent runs and run identifiers
+
+Each invocation of `backup.sh` takes an exclusive execution lock on its staging work directory and derives a unique run identifier (`soroban-backup-<UTC timestamp>-<run id>`) that is used for the archive, manifest and metrics staging files. Two concurrent invocations therefore cannot overwrite each other's artifacts.
+
+Collision behavior:
+
+- If another run already holds the lock, the new invocation fails fast with a clear error and a non-zero exit code instead of waiting or sharing the work directory. Re-run it after the in-flight backup finishes.
+- If a unique run identifier would collide with an existing artifact (for example, a stale lock left by a killed run), the run fails rather than overwriting the existing object. Remove the stale lock/artifacts after confirming no backup is running, then re-run.
+- Scheduled runs are serialized by the workflow's concurrency group, so the lock is a second line of defense for manual or overlapping invocations.
+
+### Staging free-space preflight
+
+Before creating the database dump, `backup.sh` checks that the staging work directory has at least `BACKUP_REQUIRED_FREE_BYTES` free. If free space is below the budget, the run fails immediately — before any dump is taken — with a clear error and emits the failure metric `backup_preflight_free_space_failed` (with the required and available byte counts) so alerting can distinguish space exhaustion from other failures. Size the budget to comfortably exceed the uncompressed dump plus its compressed and encrypted copies.
+
+### Artifact names and storage prefixes
+
+Artifact names and storage prefixes are validated before any local or remote path is constructed. Accepted values:
+
+- Must be non-empty and must not contain `/` or `\` (no path separators).
+- Must not contain `..` (no parent traversal).
+- Must not contain control characters (including newlines, tabs and NUL).
+- Must not be `.` or start with `-`.
+
+Names that fail validation are rejected with a clear error before any download, upload or local file is created. This applies to `--backup` values passed to `restore.sh` and to any configured storage prefix, so a crafted name cannot escape the `backups/` prefix in the bucket or the staging directory.
 
 Optional archive validation budgets for `restore.sh` (checked before any extraction):
 

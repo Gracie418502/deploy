@@ -338,12 +338,59 @@ await check("Admin stats endpoint protected", async () => {
   return `unauth=${unauthRes.status}, auth=200 (resources=${d.resources}, publishers=${d.publishers})`;
 });
 
-// OpenAPI docs
+// OpenAPI docs — verify the actual OpenAPI document, not just any 200 response.
+// An ingress SPA fallback can return HTML with status 200 for /docs, so we
+// fetch the JSON spec and assert its content signature.
+const OPENAPI_PATHS = ["/docs/json", "/openapi.json", "/docs-json"];
 await check("OpenAPI docs served", async () => {
+  const attempts = [];
+  for (const path of OPENAPI_PATHS) {
+    const res = await fetch(`${BASE}${path}`, {
+      headers: { Accept: "application/json" },
+    });
+    const contentType = res.headers.get("content-type") ?? "(none)";
+    const body = await res.text();
+    const snippet = body.slice(0, 120).replace(/\s+/g, " ").trim();
+
+    if (!res.ok) {
+      attempts.push(`${path}: HTTP ${res.status} [${contentType}] ${snippet}`);
+      continue;
+    }
+
+    if (/text\/html|application\/xhtml/i.test(contentType) || /^\s*</.test(body)) {
+      attempts.push(
+        `${path}: HTML response (SPA fallback?) [${contentType}] ${snippet}`
+      );
+      continue;
+    }
+
+    let doc;
+    try {
+      doc = JSON.parse(body);
+    } catch {
+      attempts.push(`${path}: not valid JSON [${contentType}] ${snippet}`);
+      continue;
+    }
+
+    const hasVersion = typeof doc?.openapi === "string" || typeof doc?.swagger === "string";
+    const hasInfo = doc?.info && typeof doc.info === "object";
+    if (!hasVersion || !hasInfo) {
+      attempts.push(
+        `${path}: missing OpenAPI signature (openapi/swagger + info) [${contentType}] ${snippet}`
+      );
+      continue;
+    }
+
+    const version = doc.openapi ?? doc.swagger;
+    return `${path} → OpenAPI ${version} (${doc.info.title ?? "untitled"})`;
+  }
+
+  throw new Error(`No valid OpenAPI document found:\n    ${attempts.join("\n    ")}`);
   const res = await fetch(url("/docs"));
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return "Swagger UI reachable";
 });
+=======
 
 // Frontend runtime config — optional, verifies the deployed frontend points at
 // the expected network and API base (detects wrong-environment deployments).

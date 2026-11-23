@@ -91,6 +91,9 @@ function smokeScenario(overrides = {}) {
     { status: 402, json: { error: 'Payment Required' } },
     { status: 401, json: {} },
     { status: 403, json: {} },
+    { status: 200, json: { resources: 2, publishers: 2 } },
+    { status: 200, json: { openapi: '3.0.0', info: { title: 'API', version: '1.0.0' } } },
+  ]);
     { status: 200, json: REGISTRY },
     { status: 200, text: '<html>Swagger</html>' },
     ...(overrides.tail ?? []),
@@ -105,6 +108,24 @@ test('06-smoke-test.js exits 0 when all 6 checks pass', () => {
   assert.equal(requested.length, 9);
 });
 
+test('06-smoke-test.js exits 1 when docs endpoint returns HTML (SPA fallback)', () => {
+  const { status, stdout, stderr } = runWithStub(SMOKE_SCRIPT, [
+    { status: 200, json: { status: 'healthy' } },
+    { status: 200, json: { status: 'healthy' } },
+    { status: 200, json: { resourceCount: 3 } },
+    { status: 200, json: { resources: [{ id: 'res-1' }, { id: 'res-2' }] } },
+    { status: 402, json: { error: 'Payment Required' } },
+    { status: 401, json: {} },
+    { status: 403, json: {} },
+    { status: 200, json: { resources: 2, publishers: 2 } },
+    { status: 200, text: '<html>Swagger</html>' },
+  ]);
+
+  assert.equal(status, 1);
+  assert.match(stderr, /docs/i);
+  assert.match(stdout, /5 passed  \/  1 failed/);
+});
+
 test('06-smoke-test.js exits 1 when paywall does not return 402', () => {
   const { status, stdout, stderr } = runWithStub(SMOKE_SCRIPT, [
     { status: 200, json: HEALTHY },
@@ -114,6 +135,8 @@ test('06-smoke-test.js exits 1 when paywall does not return 402', () => {
     { status: 200, json: { leaked: true } },
     { status: 401, json: {} },
     { status: 403, json: {} },
+    { status: 200, json: { resources: 1, publishers: 1 } },
+    { status: 200, json: { openapi: '3.0.0', info: { title: 'API', version: '1.0.0' } } },
     { status: 200, json: { resources: 1, publishers: 1, network: 'testnet' } },
     { status: 200, text: '<html>Swagger</html>' },
   ]);
