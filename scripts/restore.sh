@@ -75,6 +75,37 @@ manifest_field() {
   sed -n "s/^ *\"$field\": *\"\\([^\"]*\\)\".*/\\1/p" "$file" | head -n 1
 }
 
+# Read a per-component checksum from the manifest's "components" object, e.g.
+#   "components": {
+#     "database.sql.gz": "sha256:<hex>",
+#     "contracts": "sha256:<hex>"
+#   }
+# Returns the bare hex digest, or nothing when the component is not recorded.
+manifest_component_sum() {
+  local component="$1" file="$2"
+  sed -n "s/^ *\"$component\": *\"sha256:\\([0-9a-f]\\{64\\}\\)\".*/\\1/p" "$file" | head -n 1
+}
+
+# Verify a per-component checksum recorded in the manifest against a file on
+# disk. Missing manifest entries are tolerated (older manifests); a recorded
+# checksum that does not match is fatal.
+verify_component_sum() {
+  local component="$1" path="$2" file="$3"
+  local expected actual
+  expected="$(manifest_component_sum "$component" "$file")"
+  if [[ -z "$expected" ]]; then
+    log "WARNING: manifest has no checksum for $component; skipping component verification"
+    return 0
+  fi
+  [[ -f "$path" ]] || die 2 "cannot verify $component: file not found at $path"
+  actual="$(sha256sum "$path" | awk '{print $1}')"
+  if [[ "$expected" != "$actual" ]]; then
+    die 2 "component checksum mismatch for $component: expected $expected, got $actual"
+  fi
+  log "component checksum OK for $component ($actual)"
+}
+=======
+
 # Replace the database name in a postgres:// URL, keeping any query string.
 with_database() {
   local url="$1" db="$2"
@@ -293,6 +324,11 @@ fi
 MANIFEST_PATH="$WORK_DIR/$BACKUP_NAME.manifest.json"
 download_object "$PREFIX/$BACKUP_NAME.manifest.json" "$MANIFEST_PATH"
 
+# Validate the manifest schema version and required fields before touching any
+# database. Unsupported versions are rejected here, before restore.
+python3 "$(dirname "${BASH_SOURCE[0]}")/validate-archive.py" --manifest "$MANIFEST_PATH" \
+  || die 2 "manifest validation failed (unsupported schema version or missing/invalid fields)"
+
 ARCHIVE_KEY="$(manifest_field key "$MANIFEST_PATH")"
 EXPECTED_SUM="$(manifest_field value "$MANIFEST_PATH")"
 ENCRYPTION_METHOD="$(manifest_field method "$MANIFEST_PATH")"
@@ -347,8 +383,24 @@ tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR" || die 3 "archive is not a valid tar.
 
 DUMP_PATH="$EXTRACT_DIR/database.sql.gz"
 [[ -f "$DUMP_PATH" ]] || die 4 "backup does not contain a database dump (was it taken with BACKUP_SKIP_DB=1?)"
+
+# Verify per-component integrity after decryption/extraction and before any
+# restore is applied.
+log "verifying per-component checksums"
+verify_component_sum "database.sql.gz" "$DUMP_PATH" "$MANIFEST_PATH"
 if [[ -d "$EXTRACT_DIR/contracts" ]]; then
   log "contract state snapshots extracted to $EXTRACT_DIR/contracts (use --keep-work-dir to inspect)"
+  CONTRACTS_SUM="$(manifest_component_sum "contracts" "$MANIFEST_PATH")"
+  if [[ -n "$CONTRACTS_SUM" ]]; then
+    CONTRACTS_ACTUAL="$(cd "$EXTRACT_DIR" && find contracts -type f -print0 \
+      | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')"
+    if [[ "$CONTRACTS_SUM" != "$CONTRACTS_ACTUAL" ]]; then
+      die 2 "component checksum mismatch for contracts: expected $CONTRACTS_SUM, got $CONTRACTS_ACTUAL"
+    fi
+    log "component checksum OK for contracts ($CONTRACTS_ACTUAL)"
+  else
+    log "WARNING: manifest has no checksum for contracts; skipping component verification"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

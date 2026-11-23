@@ -33,3 +33,155 @@ for name, kind, valid in [('./database.sql.gz', tarfile.REGTYPE, True), ('../esc
   );
   assert.equal(result.status, 0, result.error?.message || result.stderr);
 });
+
+test('manifest validation accepts a valid versioned manifest', () => {
+  const result = spawnSync(
+    'python3',
+    [
+      '-c',
+      `
+import importlib.util, json
+spec = importlib.util.spec_from_file_location('validator', 'scripts/validate-archive.py')
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+manifest = {
+    'schemaVersion': 1,
+    'postgresServerVersion': '16.3',
+    'pgDumpVersion': '16.3',
+    'componentChecksums': {
+        'database.sql.gz': 'a' * 64,
+        'contracts.tar.gz': 'b' * 64,
+    },
+}
+module.validate_manifest(manifest)
+`,
+    ],
+    { cwd: path.resolve(__dirname, '..'), encoding: 'utf8' }
+  );
+  assert.equal(result.status, 0, result.error?.message || result.stderr);
+});
+
+test('manifest validation rejects an unsupported schema version', () => {
+  const result = spawnSync(
+    'python3',
+    [
+      '-c',
+      `
+import importlib.util
+spec = importlib.util.spec_from_file_location('validator', 'scripts/validate-archive.py')
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+manifest = {
+    'schemaVersion': 999,
+    'postgresServerVersion': '16.3',
+    'pgDumpVersion': '16.3',
+    'componentChecksums': {
+        'database.sql.gz': 'a' * 64,
+        'contracts.tar.gz': 'b' * 64,
+    },
+}
+try:
+    module.validate_manifest(manifest)
+except ValueError:
+    pass
+else:
+    raise AssertionError('unsupported schemaVersion was accepted')
+`,
+    ],
+    { cwd: path.resolve(__dirname, '..'), encoding: 'utf8' }
+  );
+  assert.equal(result.status, 0, result.error?.message || result.stderr);
+});
+
+test('manifest validation rejects missing required fields and wrong types', () => {
+  const result = spawnSync(
+    'python3',
+    [
+      '-c',
+      `
+import importlib.util
+spec = importlib.util.spec_from_file_location('validator', 'scripts/validate-archive.py')
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+base = {
+    'schemaVersion': 1,
+    'postgresServerVersion': '16.3',
+    'pgDumpVersion': '16.3',
+    'componentChecksums': {
+        'database.sql.gz': 'a' * 64,
+        'contracts.tar.gz': 'b' * 64,
+    },
+}
+invalid = []
+for field in ('schemaVersion', 'postgresServerVersion', 'pgDumpVersion', 'componentChecksums'):
+    manifest = dict(base)
+    del manifest[field]
+    invalid.append(manifest)
+for field, value in (
+    ('schemaVersion', '1'),
+    ('schemaVersion', True),
+    ('postgresServerVersion', 16),
+    ('pgDumpVersion', None),
+    ('componentChecksums', []),
+    ('componentChecksums', 'not-a-mapping'),
+):
+    manifest = dict(base)
+    manifest[field] = value
+    invalid.append(manifest)
+for manifest in invalid:
+    try:
+        module.validate_manifest(manifest)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('invalid manifest was accepted: %r' % (manifest,))
+`,
+    ],
+    { cwd: path.resolve(__dirname, '..'), encoding: 'utf8' }
+  );
+  assert.equal(result.status, 0, result.error?.message || result.stderr);
+});
+
+test('manifest validation rejects malformed component checksums', () => {
+  const result = spawnSync(
+    'python3',
+    [
+      '-c',
+      `
+import importlib.util
+spec = importlib.util.spec_from_file_location('validator', 'scripts/validate-archive.py')
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+base = {
+    'schemaVersion': 1,
+    'postgresServerVersion': '16.3',
+    'pgDumpVersion': '16.3',
+    'componentChecksums': {
+        'database.sql.gz': 'a' * 64,
+        'contracts.tar.gz': 'b' * 64,
+    },
+}
+invalid_checksums = [
+    {},
+    {'database.sql.gz': 'a' * 64},
+    {'database.sql.gz': 'a' * 64, 'contracts.tar.gz': 'b' * 64, '../escape': 'c' * 64},
+    {'database.sql.gz': 'not-a-hash', 'contracts.tar.gz': 'b' * 64},
+    {'database.sql.gz': 'a' * 63, 'contracts.tar.gz': 'b' * 64},
+    {'database.sql.gz': 'g' * 64, 'contracts.tar.gz': 'b' * 64},
+    {'database.sql.gz': 123, 'contracts.tar.gz': 'b' * 64},
+]
+for checksums in invalid_checksums:
+    manifest = dict(base)
+    manifest['componentChecksums'] = checksums
+    try:
+        module.validate_manifest(manifest)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('malformed checksums were accepted: %r' % (checksums,))
+`,
+    ],
+    { cwd: path.resolve(__dirname, '..'), encoding: 'utf8' }
+  );
+  assert.equal(result.status, 0, result.error?.message || result.stderr);
+});

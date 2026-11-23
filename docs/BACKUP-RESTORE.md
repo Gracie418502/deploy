@@ -50,12 +50,52 @@ Repository secrets:
 
 Optional repository variables for the contract-state snapshot: `SOROBAN_RPC_URL`, `SOROBAN_NETWORK_PASSPHRASE`, `SOROBAN_CONTRACT_IDS` (comma-separated).
 
+Optional tuning variables for network calls (both `backup.sh` and `restore.sh`):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BACKUP_RPC_TIMEOUT_SECONDS` | `30` | Per-attempt deadline for each Soroban RPC call |
+| `BACKUP_STORAGE_TIMEOUT_SECONDS` | `60` | Per-attempt deadline for each object-storage (S3) call |
+| `BACKUP_RETRY_MAX_ATTEMPTS` | `4` | Total attempts (initial try + retries) for transient failures |
+| `BACKUP_RETRY_BASE_DELAY_SECONDS` | `2` | Base delay for exponential backoff between attempts (capped) |
+
+### Network deadlines and retries
+
+Every RPC and object-storage call is bounded by a deadline (`timeout`/`--cli-read-timeout` for `aws`, `curl --max-time` for RPC) so a hung endpoint cannot stall a backup or restore indefinitely. Transient failures — timeouts, connection resets, HTTP 429/5xx, and S3 `RequestTimeout`/`SlowDown`/`InternalError` responses — are retried with exponential backoff up to `BACKUP_RETRY_MAX_ATTEMPTS` total attempts.
+
+Non-transient failures are **not** retried: invalid or expired credentials (HTTP 401/403, S3 `AccessDenied`/`InvalidAccessKeyId`/`SignatureDoesNotMatch`/`ExpiredToken`), missing buckets or objects (404/`NoSuchBucket`/`NoSuchKey`), and malformed requests fail immediately with a clear error. This prevents lockouts and wasted time when the credentials themselves are wrong; fix the credentials and re-run.
+
 ### Backup layout
 
 Each run writes two objects under `s3://<bucket>/backups/`:
 
 - `soroban-backup-<UTC timestamp>.tar.gz.enc` — encrypted tarball containing `database.sql.gz` (plain SQL with `DROP ... IF EXISTS`), `tables.txt` (table list used for verification) and `contracts/` (contract state snapshots, when configured).
-- `soroban-backup-<UTC timestamp>.manifest.json` — timestamp, SHA-256 of the encrypted archive, size, encryption method and source metadata. A copy is uploaded as a workflow artifact.
+- `soroban-backup-<UTC timestamp>.manifest.json` — a copy is uploaded as a workflow artifact. It contains:
+  - `schemaVersion` — manifest schema version (currently `1`).
+  - `timestamp`, `size`, `encryption` method and source metadata.
+  - `archiveSha256` — SHA-256 of the encrypted archive.
+  - `components` — per-component SHA-256 checksums recorded before encryption: `database.sql.gz`, `tables.txt` and each file under `contracts/`.
+  - `postgres` — `serverVersion` (from `SHOW server_version`) and `pgDumpVersion` (from `pg_dump --version`).
+
+### Manifest schema and compatibility policy
+
+The manifest declares a `schemaVersion`. `restore.sh` validates the manifest before touching the target database: required fields must be present and correctly typed, and the `schemaVersion` must be one it supports (currently `1`). Unsupported or newer schema versions are rejected with a clear error before any download or restore work begins, so an old `restore.sh` never misinterprets a newer manifest.
+
+Compatibility policy:
+
+- Adding optional fields is backward compatible and does not bump `schemaVersion`.
+- Removing or changing the meaning/type of an existing field bumps `schemaVersion`.
+- `restore.sh` accepts only schema versions it explicitly knows; to restore a backup written by a newer `backup.sh`, use a `restore.sh` from the same or a newer release.
+- Manifests without `schemaVersion` (written before versioning) are treated as legacy and rejected by current `restore.sh`; restore them with the release that produced them.
+
+### PostgreSQL version metadata and restore compatibility
+
+The manifest records both the PostgreSQL **server** version and the **`pg_dump` client** version used to produce the dump. Before restoring, compare them with the target server:
+
+- A dump taken by a `pg_dump` **newer** than the target server major version cannot be restored reliably — restore into a server at least as new as the recorded `pgDumpVersion`, or use a backup taken with a matching client.
+- A dump taken by a `pg_dump` **older** than the target server is generally restorable, but review release notes for the major version jump.
+- If `serverVersion` and `pgDumpVersion` differ in major version, treat the backup as suspect and prefer one where they match (see section 0).
+=======
 
 ## 3. Retention Policy
 
@@ -129,7 +169,7 @@ When hosting PostgreSQL on Supabase in production, enable **Supabase Point-in-Ti
    ```bash
    ./scripts/restore.sh --backup soroban-backup-<timestamp> --database-url "$DATABASE_URL"
    ```
-   The script downloads the manifest and archive, verifies the SHA-256 checksum, decrypts, and replays the dump in a single transaction (a failed restore changes nothing). Objects in the target that are not in the backup are left in place.
+   The script downloads the manifest and archive, validates the manifest schema version and required fields, verifies the archive SHA-256, decrypts, then verifies each component checksum from `components` against the decrypted files before replaying the dump in a single transaction (a failed restore changes nothing). Objects in the target that are not in the backup are left in place. If the manifest's `postgres` versions are incompatible with the target server, the script warns (or aborts with `--verify-only`) before applying anything.
 
 4. **Inspect contract state snapshots (if needed).** Add `--keep-work-dir` to keep the extracted `contracts/` snapshots. On-chain state cannot be "restored"; use the snapshots to confirm which contract IDs the application should point at, and use `scripts/rollback-contracts.cjs` to repoint it.
 
@@ -155,7 +195,7 @@ After restore, verify the following:
 
 ### 7.4 Rollback
 
-If the restore fails, `restore.sh` rolls its transaction back and exits non-zero (2 = download/checksum, 3 = decryption, 4 = restore, 5 = verification). Fix the cause and re-run, or re-attempt with an earlier backup. Document the failure and notify the on-call engineer.
+If the restore fails, `restore.sh` rolls its transaction back and exits non-zero (2 = download/manifest validation/checksum, 3 = decryption or component checksum mismatch, 4 = restore, 5 = verification). Fix the cause and re-run, or re-attempt with an earlier backup. If the failure is an unsupported manifest `schemaVersion`, use a `restore.sh` from the matching or newer release. Document the failure and notify the on-call engineer.
 
 ## 8. Testing
 
