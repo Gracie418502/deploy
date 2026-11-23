@@ -43,6 +43,104 @@ Kubernetes ConfigMap. Restart the backend afterwards to pick up the change.
 
 ---
 
+## Contract TTL inspection and extension
+
+Soroban contract **instances** and their **WASM code** entries are stored in
+ledger entries that expire unless their time-to-live (TTL) is extended. If an
+entry expires, calls to the contract fail until it is restored. After every
+deploy the script therefore inspects the remaining TTL of each contract's
+instance entry and code entry and records the observed ledger values (current
+ledger sequence and the live-until ledger of each entry) in its output and in
+`contract-ids.env`-adjacent deploy logs.
+
+### Configuring the minimum thresholds
+
+The script compares the observed TTL against configurable minimums and warns
+(or fails, with `--strict-ttl`) when an entry is below them:
+
+| Option | Env var | Meaning |
+| --- | --- | --- |
+| `--min-instance-ttl <ledgers>` | `MIN_INSTANCE_TTL_LEDGERS` | Minimum remaining ledgers for contract instance entries |
+| `--min-code-ttl <ledgers>` | `MIN_CODE_TTL_LEDGERS` | Minimum remaining ledgers for contract code (WASM) entries |
+
+```bash
+# Warn if either entry has less than ~30 days of TTL left
+# (Stellar ledgers close roughly every 5 seconds, so 30 days ≈ 518,400 ledgers)
+MIN_INSTANCE_TTL_LEDGERS=518400 MIN_CODE_TTL_LEDGERS=518400 \
+npm run deploy:contracts -- --network testnet
+
+# Or pass the thresholds explicitly; --strict-ttl turns warnings into a failure
+npm run deploy:contracts -- --network testnet \
+  --min-instance-ttl 518400 --min-code-ttl 518400 --strict-ttl
+```
+
+### Interpreting the results
+
+- **OK** — remaining TTL is at or above the configured minimum for both the
+  instance and code entries.
+- **WARN** — an entry is below the minimum. The deploy still succeeds, but
+  extend the TTL before it expires (see below).
+- **FAIL** — with `--strict-ttl`, a below-minimum entry aborts the run with a
+  non-zero exit code. Use this in CI so a deploy that leaves contracts close to
+  expiry is caught immediately.
+
+If the script cannot read an entry's TTL (e.g. the contract ID does not exist
+on the target network), treat it as a failure and re-check the contract IDs.
+
+### Extending TTL
+
+Extend both the **instance** entry and the **code** entry for every deployed
+contract. Using the Stellar CLI:
+
+```bash
+# Extend the contract instance entry
+stellar contract extend \
+  --id "$STELLAR_CONTRACT_VAULT_REGISTRY" \
+  --source <admin-secret-key> \
+  --network testnet \
+  --ledger 518400
+
+# Extend the contract code (WASM) entry — pass the WASM hash of the deployed code
+stellar contract extend \
+  --id "$STELLAR_CONTRACT_VAULT_REGISTRY" \
+  --source <admin-secret-key> \
+  --network testnet \
+  --wasm-hash <wasm-hash> \
+  --ledger 518400
+```
+
+Repeat for `access-lease` and `subscription`. `--ledger` is the number of
+ledgers to extend the entry's TTL by (relative to the current ledger), so pick a
+value that comfortably exceeds your minimum threshold.
+
+From the SDK, use `extendFootprintTtl` to extend the entries touched by a
+simulated invocation, or `extendContractInstance` to extend a contract's
+instance entry directly:
+
+```js
+const { SorobanRpc, TransactionBuilder, Networks, Operation } = require('@stellar/stellar-sdk');
+
+// Extend the instance entry of a deployed contract
+const op = Operation.extendContractInstance({
+  contract: contractId,
+  extendTo: currentLedger + 518400,
+});
+
+// Or extend the footprint (instance + code) of a simulated invocation
+const extendOp = Operation.extendFootprintTtl({ extendTo: currentLedger + 518400 });
+```
+
+After extending, re-run the TTL inspection (or the deploy script with
+`--dry-run`) to confirm the new live-until ledger values are above the
+configured minimums, and record them in the deployment notes.
+
+> **Testnet resets:** a Stellar testnet reset wipes all ledger state, including
+> contracts and their TTLs. Follow the
+> [testnet reset recovery runbook](./testnet-reset-recovery.md) to re-fund
+> accounts, redeploy contracts and reconcile the backend catalog.
+
+---
+
 ## Updating the backend ConfigMap after a contract deploy
 
 The backend ConfigMap (`k8s/configmap.yaml`) tracks the contract IDs in Git so

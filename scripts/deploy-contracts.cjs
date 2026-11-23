@@ -67,6 +67,15 @@ const DEFAULT_RPC_URLS = {
 
 const DEFAULT_WASM_DIR = path.join(ROOT_DIR, 'target', 'wasm32-unknown-unknown', 'release');
 
+// Default TTL thresholds, expressed in ledgers. Soroban ledgers close roughly
+// every 5 seconds, so 1000 ledgers is a little under 1.5 hours.
+const DEFAULT_MIN_INSTANCE_TTL_LEDGERS = 1000;
+const DEFAULT_MIN_CODE_TTL_LEDGERS = 1000;
+
+// Hard floor below which a deployment is considered failed. When remaining TTL
+// drops under this value the script exits non-zero (unless --ttl-fail-mode=warn).
+const DEFAULT_TTL_HARD_FLOOR_LEDGERS = 100;
+
 // Each contract exposes `init(admin: Address)`.
 const CONTRACTS = [
   { name: 'vault-registry', wasmFile: 'vault_registry.wasm' },
@@ -90,8 +99,24 @@ const MIN_BALANCE_STROOPS = 100_000_000n; // 10 XLM
 // CLI argument parsing
 // ---------------------------------------------------------------------------
 
+function parsePositiveInt(value, flagName) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${flagName} requires a non-negative integer (got: ${value})`);
+  }
+  return parsed;
+}
+
 function parseArgs(argv) {
-  const args = { network: null, dryRun: false, yes: false, wasmDir: null };
+  const args = {
+    network: null,
+    dryRun: false,
+    yes: false,
+    wasmDir: null,
+    minInstanceTtl: null,
+    minCodeTtl: null,
+    ttlFailMode: null,
+  };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -115,6 +140,33 @@ function parseArgs(argv) {
       args.network = value;
     } else if (arg.startsWith('--network=')) {
       args.network = arg.slice('--network='.length);
+    } else if (arg === '--min-instance-ttl') {
+      const value = argv[++i];
+      if (value === undefined) {
+        throw new Error('--min-instance-ttl requires a value');
+      }
+      args.minInstanceTtl = parsePositiveInt(value, '--min-instance-ttl');
+    } else if (arg.startsWith('--min-instance-ttl=')) {
+      args.minInstanceTtl = parsePositiveInt(
+        arg.slice('--min-instance-ttl='.length),
+        '--min-instance-ttl'
+      );
+    } else if (arg === '--min-code-ttl') {
+      const value = argv[++i];
+      if (value === undefined) {
+        throw new Error('--min-code-ttl requires a value');
+      }
+      args.minCodeTtl = parsePositiveInt(value, '--min-code-ttl');
+    } else if (arg.startsWith('--min-code-ttl=')) {
+      args.minCodeTtl = parsePositiveInt(arg.slice('--min-code-ttl='.length), '--min-code-ttl');
+    } else if (arg === '--ttl-fail-mode') {
+      const value = argv[++i];
+      if (!value) {
+        throw new Error('--ttl-fail-mode requires a value (warn|fail)');
+      }
+      args.ttlFailMode = value;
+    } else if (arg.startsWith('--ttl-fail-mode=')) {
+      args.ttlFailMode = arg.slice('--ttl-fail-mode='.length);
     } else if (arg === '--help' || arg === '-h') {
       printUsage();
       process.exit(0);
@@ -127,6 +179,10 @@ function parseArgs(argv) {
     throw new Error(
       `Invalid --network value: ${args.network} (expected testnet|mainnet|futurenet or set SOROBAN_RPC_URL for local)`
     );
+  }
+
+  if (args.ttlFailMode && !['warn', 'fail'].includes(args.ttlFailMode)) {
+    throw new Error(`Invalid --ttl-fail-mode value: ${args.ttlFailMode} (expected warn|fail)`);
   }
 
   return args;
@@ -142,6 +198,12 @@ Options:
                                          (defaults to $CONTRACTS_WASM_DIR, then ./target/wasm32-unknown-unknown/release).
   --yes, -y                              Skip the interactive mainnet confirmation (for CI).
   --dry-run                              Perform all checks without submitting transactions.
+  --min-instance-ttl <ledgers>           Warn when a contract instance's remaining TTL is below this
+                                         value (defaults to $MIN_INSTANCE_TTL_LEDGERS, then ${DEFAULT_MIN_INSTANCE_TTL_LEDGERS}).
+  --min-code-ttl <ledgers>               Warn when a contract's code entry remaining TTL is below this
+                                         value (defaults to $MIN_CODE_TTL_LEDGERS, then ${DEFAULT_MIN_CODE_TTL_LEDGERS}).
+  --ttl-fail-mode <warn|fail>            Behavior when remaining TTL drops below the hard floor
+                                         (${DEFAULT_TTL_HARD_FLOOR_LEDGERS} ledgers). Defaults to "fail".
   --help, -h                             Show this help message.
 `);
 }
@@ -205,7 +267,28 @@ function validateEnv(args) {
   const wasmDir = path.resolve(args.wasmDir || process.env.CONTRACTS_WASM_DIR || DEFAULT_WASM_DIR);
   const contracts = CONTRACTS.map((c) => ({ ...c, wasm: path.join(wasmDir, c.wasmFile) }));
 
-  return { keypair, network, rpcUrl, adminAddress, contracts };
+  const minInstanceTtl =
+    args.minInstanceTtl ??
+    (process.env.MIN_INSTANCE_TTL_LEDGERS !== undefined
+      ? parsePositiveInt(process.env.MIN_INSTANCE_TTL_LEDGERS, 'MIN_INSTANCE_TTL_LEDGERS')
+      : DEFAULT_MIN_INSTANCE_TTL_LEDGERS);
+  const minCodeTtl =
+    args.minCodeTtl ??
+    (process.env.MIN_CODE_TTL_LEDGERS !== undefined
+      ? parsePositiveInt(process.env.MIN_CODE_TTL_LEDGERS, 'MIN_CODE_TTL_LEDGERS')
+      : DEFAULT_MIN_CODE_TTL_LEDGERS);
+  const ttlFailMode = args.ttlFailMode || 'fail';
+
+  return {
+    keypair,
+    network,
+    rpcUrl,
+    adminAddress,
+    contracts,
+    minInstanceTtl,
+    minCodeTtl,
+    ttlFailMode,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +620,136 @@ async function verifyContract({ server, contractId, dryRun, contractName, expect
 }
 
 // ---------------------------------------------------------------------------
+// TTL inspection
+// ---------------------------------------------------------------------------
+
+function readLiveUntilLedgerSeq(entry) {
+  if (!entry) return null;
+  const raw =
+    typeof entry.liveUntilLedgerSeq === 'function'
+      ? entry.liveUntilLedgerSeq()
+      : entry.liveUntilLedgerSeq;
+  if (raw === undefined || raw === null) return null;
+  return Number(raw.toString());
+}
+
+async function fetchTtlForEntry({ server, key, durability, label }) {
+  let entry;
+  try {
+    entry = await server.getContractData(key, durability);
+  } catch (err) {
+    log.warn(`Unable to read ${label} ledger entry: ${err.message}`);
+    return null;
+  }
+  if (!entry) {
+    log.warn(`No ${label} ledger entry found`);
+    return null;
+  }
+  const liveUntilLedgerSeq = readLiveUntilLedgerSeq(entry);
+  if (liveUntilLedgerSeq === null) {
+    log.warn(`No liveUntilLedgerSeq reported for ${label} ledger entry`);
+    return null;
+  }
+  return liveUntilLedgerSeq;
+}
+
+/**
+ * Inspect the remaining TTL of a deployed contract's instance and code entries.
+ *
+ * Returns an object describing the observed ledger values and whether the
+ * configured minimums were met:
+ *   {
+ *     contractName, contractId, currentLedger,
+ *     instance: { liveUntilLedger, remainingTtl, minTtl, belowMinimum },
+ *     code:     { liveUntilLedger, remainingTtl, minTtl, belowMinimum },
+ *     belowHardFloor: boolean,
+ *   }
+ */
+async function inspectContractTtl({
+  server,
+  contractId,
+  contractName,
+  wasmHash,
+  minInstanceTtl = DEFAULT_MIN_INSTANCE_TTL_LEDGERS,
+  minCodeTtl = DEFAULT_MIN_CODE_TTL_LEDGERS,
+  hardFloor = DEFAULT_TTL_HARD_FLOOR_LEDGERS,
+  dryRun = false,
+}) {
+  log.step(`Inspecting TTL for "${contractName}"`);
+
+  if (dryRun) {
+    log.info(`[dry-run] Would inspect TTL for "${contractName}" at ${contractId}`);
+    return null;
+  }
+
+  const latest = await server.getLatestLedger();
+  const currentLedger = Number(latest.sequence);
+  log.info(`Current ledger: ${currentLedger}`);
+
+  const instanceLiveUntil = await fetchTtlForEntry({
+    server,
+    key: xdr.ScVal.scvLedgerKeyContractInstance(),
+    durability: rpc.Durability.Persistent,
+    label: `"${contractName}" instance`,
+  });
+
+  let codeLiveUntil = null;
+  if (wasmHash) {
+    codeLiveUntil = await fetchTtlForEntry({
+      server,
+      key: xdr.ScVal.scvLedgerKeyContractCode(Buffer.from(wasmHash, 'hex')),
+      durability: rpc.Durability.Persistent,
+      label: `"${contractName}" code`,
+    });
+  } else {
+    log.warn(`No WASM hash available for "${contractName}"; skipping code TTL inspection`);
+  }
+
+  const summarize = (liveUntilLedger, minTtl, label) => {
+    if (liveUntilLedger === null) {
+      return { liveUntilLedger: null, remainingTtl: null, minTtl, belowMinimum: null };
+    }
+    const remainingTtl = liveUntilLedger - currentLedger;
+    const belowMinimum = remainingTtl < minTtl;
+    log.info(
+      `${label}: liveUntilLedger=${liveUntilLedger}, remainingTtl=${remainingTtl} ledgers ` +
+        `(minimum ${minTtl})`
+    );
+    if (belowMinimum) {
+      log.warn(
+        `${label} remaining TTL (${remainingTtl} ledgers) is below the configured minimum (${minTtl} ledgers).`
+      );
+    } else {
+      log.ok(`${label} remaining TTL is above the configured minimum`);
+    }
+    return { liveUntilLedger, remainingTtl, minTtl, belowMinimum };
+  };
+
+  const instance = summarize(instanceLiveUntil, minInstanceTtl, `"${contractName}" instance TTL`);
+  const code = summarize(codeLiveUntil, minCodeTtl, `"${contractName}" code TTL`);
+
+  const belowHardFloor =
+    (instance.remainingTtl !== null && instance.remainingTtl < hardFloor) ||
+    (code.remainingTtl !== null && code.remainingTtl < hardFloor);
+
+  if (belowHardFloor) {
+    log.warn(
+      `"${contractName}" remaining TTL is below the hard floor of ${hardFloor} ledgers. ` +
+        'Extend the contract TTL (e.g. via `stellar contract extend` or a bump-footprint operation).'
+    );
+  }
+
+  return {
+    contractName,
+    contractId,
+    currentLedger,
+    instance,
+    code,
+    belowHardFloor,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Resume logic
 // ---------------------------------------------------------------------------
 
@@ -590,7 +803,15 @@ function writeContractIds(contractIds, network, dryRun) {
   log.ok(`Wrote contract IDs to ${CONTRACT_IDS_FILE}`);
 }
 
-function writeDeploymentRecord(contractIds, network, adminAddress, deployer, txHashes, dryRun) {
+function writeDeploymentRecord(
+  contractIds,
+  network,
+  adminAddress,
+  deployer,
+  txHashes,
+  dryRun,
+  ttlObservations = {}
+) {
   log.step('Writing deployment record');
 
   const deploymentJson = {
@@ -600,6 +821,7 @@ function writeDeploymentRecord(contractIds, network, adminAddress, deployer, txH
     adminAddress,
     contracts: contractIds,
     transactionHashes: txHashes,
+    ttl: ttlObservations,
     gitRef: process.env.GIT_REF || null,
   };
 
@@ -623,7 +845,16 @@ function writeDeploymentRecord(contractIds, network, adminAddress, deployer, txH
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
-  const { keypair, network, rpcUrl, adminAddress, contracts } = validateEnv(args);
+  const {
+    keypair,
+    network,
+    rpcUrl,
+    adminAddress,
+    contracts,
+    minInstanceTtl,
+    minCodeTtl,
+    ttlFailMode,
+  } = validateEnv(args);
   const networkPassphrase = NETWORK_PASSPHRASES[network];
 
   log.info(`Target network: ${network}`);
@@ -651,6 +882,34 @@ async function main() {
   }
   const contractIds = { ...existingIds };
 
+  // TTL observations keyed by contract name, recorded in the deployment record.
+  const ttlObservations = {};
+  const wasmHashes = {};
+  let ttlHardFloorBreached = false;
+
+  const recordTtl = async (contractName, contractId, wasmHash) => {
+    const observation = await inspectContractTtl({
+      server,
+      contractId,
+      contractName,
+      wasmHash,
+      minInstanceTtl,
+      minCodeTtl,
+      dryRun: args.dryRun,
+    });
+    if (observation) {
+      ttlObservations[contractName] = observation;
+      if (observation.belowHardFloor) {
+        ttlHardFloorBreached = true;
+      }
+    }
+  };
+
+  // Inspect TTL for resumed contracts too.
+  for (const [contractName, contractId] of Object.entries(existingIds)) {
+    await recordTtl(contractName, contractId, wasmHashes[contractName]);
+  }
+
   const contractsToDeploy = contracts.filter((c) => !existingIds[c.name]);
 
   if (contractsToDeploy.length < contracts.length) {
@@ -669,6 +928,7 @@ async function main() {
       dryRun: args.dryRun,
       contractName: contract.name,
     });
+    wasmHashes[contract.name] = wasmHash;
 
     const contractId = await deployContract({
       server,
@@ -697,15 +957,35 @@ async function main() {
       expectedAdmin: adminAddress,
     });
 
+    await recordTtl(contract.name, contractId, wasmHash);
+
     contractIds[contract.name] = contractId;
   }
 
   writeContractIds(contractIds, network, args.dryRun);
-  writeDeploymentRecord(contractIds, network, adminAddress, keypair.publicKey(), {}, args.dryRun);
+  writeDeploymentRecord(
+    contractIds,
+    network,
+    adminAddress,
+    keypair.publicKey(),
+    {},
+    args.dryRun,
+    ttlObservations
+  );
 
   log.step('Deployment complete');
   for (const [name, id] of Object.entries(contractIds)) {
     log.ok(`${name}: ${id}`);
+  }
+
+  if (ttlHardFloorBreached) {
+    const message =
+      `One or more contracts have remaining TTL below the hard floor of ` +
+      `${DEFAULT_TTL_HARD_FLOOR_LEDGERS} ledgers. Extend the contract TTL before relying on it.`;
+    if (ttlFailMode === 'fail') {
+      throw new Error(message);
+    }
+    log.warn(message);
   }
 }
 
@@ -731,6 +1011,7 @@ module.exports = {
   deployContract,
   initContract,
   verifyContract,
+  inspectContractTtl,
   loadExistingContractIds,
   writeContractIds,
   writeDeploymentRecord,

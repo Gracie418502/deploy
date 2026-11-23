@@ -276,6 +276,117 @@ test('deployment resume rejects contract IDs from another network', () => {
   }
 });
 
+test('inspectContractTtl reports remaining TTL and warns below the minimum', async () => {
+  const { nativeToScVal } = require('@stellar/stellar-sdk');
+  const latestLedger = 1000;
+  const instanceLiveUntil = 1000 + 5000;
+  const codeLiveUntil = 1000 + 200;
+
+  const makeEntry = (liveUntilLedgerSeq) => ({
+    val: { value: { val: { value: { storage: [] } } } },
+    liveUntilLedgerSeq,
+  });
+
+  const server = {
+    getLatestLedger: async () => ({ sequence: latestLedger }),
+    getContractData: async () => makeEntry(instanceLiveUntil),
+    getContractCodeLedgerEntry: async () => makeEntry(codeLiveUntil),
+  };
+
+  const logs = [];
+  const warnings = [];
+  const result = await deploy.inspectContractTtl({
+    server,
+    contractId: VALID_ID,
+    contractName: 'test-contract',
+    minTtlLedgers: 1000,
+    hardFloorLedgers: 100,
+    log: (msg) => logs.push(msg),
+    warn: (msg) => warnings.push(msg),
+  });
+
+  assert.equal(result.latestLedger, latestLedger);
+  assert.equal(result.instance.liveUntilLedgerSeq, instanceLiveUntil);
+  assert.equal(result.instance.remaining, 5000);
+  assert.equal(result.code.liveUntilLedgerSeq, codeLiveUntil);
+  assert.equal(result.code.remaining, 200);
+
+  // Observed ledger values are logged.
+  const joined = logs.join('\n');
+  assert.match(joined, new RegExp(String(instanceLiveUntil)));
+  assert.match(joined, new RegExp(String(codeLiveUntil)));
+
+  // Code TTL is below the minimum but above the hard floor: warn, don't fail.
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /code/);
+  assert.match(warnings[0], /200/);
+});
+
+test('inspectContractTtl fails when TTL is below the hard floor', async () => {
+  const latestLedger = 2000;
+  const server = {
+    getLatestLedger: async () => ({ sequence: latestLedger }),
+    getContractData: async () => ({ liveUntilLedgerSeq: latestLedger + 10 }),
+    getContractCodeLedgerEntry: async () => ({ liveUntilLedgerSeq: latestLedger + 5000 }),
+  };
+
+  await assert.rejects(
+    () =>
+      deploy.inspectContractTtl({
+        server,
+        contractId: VALID_ID,
+        contractName: 'test-contract',
+        minTtlLedgers: 1000,
+        hardFloorLedgers: 100,
+        log: () => {},
+        warn: () => {},
+      }),
+    /below the hard floor/
+  );
+});
+
+test('inspectContractTtl treats missing ledger entries as expired', async () => {
+  const server = {
+    getLatestLedger: async () => ({ sequence: 500 }),
+    getContractData: async () => null,
+    getContractCodeLedgerEntry: async () => null,
+  };
+
+  await assert.rejects(
+    () =>
+      deploy.inspectContractTtl({
+        server,
+        contractId: VALID_ID,
+        contractName: 'test-contract',
+        minTtlLedgers: 1000,
+        hardFloorLedgers: 100,
+        log: () => {},
+        warn: () => {},
+      }),
+    /not found|expired/i
+  );
+});
+
+test('deployment record includes observed TTL values', () => {
+  const record = deploy.buildDeploymentRecord({
+    network: 'testnet',
+    contractName: 'vault-registry',
+    contractId: VALID_ID,
+    wasmHash: 'abc123',
+    ttl: {
+      latestLedger: 1000,
+      instance: { liveUntilLedgerSeq: 6000, remaining: 5000 },
+      code: { liveUntilLedgerSeq: 1200, remaining: 200 },
+    },
+  });
+
+  assert.equal(record.ttl.latestLedger, 1000);
+  assert.equal(record.ttl.instance.liveUntilLedgerSeq, 6000);
+  assert.equal(record.ttl.instance.remaining, 5000);
+  assert.equal(record.ttl.code.liveUntilLedgerSeq, 1200);
+  assert.equal(record.ttl.code.remaining, 200);
+});
+
 test('contract verification rejects an unexpected on-chain admin', async () => {
   const { nativeToScVal } = require('@stellar/stellar-sdk');
   const server = {
