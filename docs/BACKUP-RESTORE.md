@@ -97,6 +97,223 @@ The manifest records both the PostgreSQL **server** version and the **`pg_dump` 
 - If `serverVersion` and `pgDumpVersion` differ in major version, treat the backup as suspect and prefer one where they match (see section 0).
 =======
 
+## 2.1 Object-Storage Credential Scopes (Least Privilege)
+
+The backup and restore tooling needs three distinct kinds of access to the backup bucket. Grant each one to a **separate** credential so that a leaked upload key cannot delete backups, and a restore key cannot overwrite them.
+
+| Scope | Used by | Operations needed | Typical lifetime |
+| --- | --- | --- | --- |
+| **Upload** | `scripts/backup.sh` (daily job) | Write new objects; abort interrupted multipart uploads | Long-lived CI secret |
+| **Pruning** | Bucket lifecycle / retention job | List objects and delete expired ones | Long-lived, tightly held |
+| **Restore** | `scripts/restore.sh` (on-call, verify job) | Read/list objects only | Short-lived, issued per incident |
+
+The scripts themselves never delete backups (see section 3); pruning is done by the bucket lifecycle policy or a dedicated job. All examples below use placeholders — never commit real keys, account IDs or bucket names.
+
+### 2.1.1 AWS S3
+
+Upload policy (attach to the backup role/user):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BackupUpload",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:AbortMultipartUpload"
+      ],
+      "Resource": "arn:aws:s3:::${BACKUP_STORAGE_BUCKET}/backups/*"
+    }
+  ]
+}
+```
+
+Pruning policy (lifecycle job only):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BackupPrune",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:ListBucketMultipartUploads"
+      ],
+      "Resource": "arn:aws:s3:::${BACKUP_STORAGE_BUCKET}"
+    },
+    {
+      "Sid": "BackupPruneDelete",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::${BACKUP_STORAGE_BUCKET}/backups/*"
+    }
+  ]
+}
+```
+
+Restore policy (on-call / verify job):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BackupRestore",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::${BACKUP_STORAGE_BUCKET}",
+        "arn:aws:s3:::${BACKUP_STORAGE_BUCKET}/backups/*"
+      ]
+    }
+  ]
+}
+```
+
+Verify the effective permissions without printing credentials:
+
+```bash
+# Bucket policy (shows what is granted, not who holds the keys)
+aws s3api get-bucket-policy --bucket "$BACKUP_STORAGE_BUCKET" --query Policy --output text
+
+# Confirm the current identity and that it is the expected role
+aws sts get-caller-identity
+
+# Dry-run each scope; expect AccessDenied for the scopes this key must not have
+aws s3api head-bucket --bucket "$BACKUP_STORAGE_BUCKET"
+aws s3api list-objects-v2 --bucket "$BACKUP_STORAGE_BUCKET" --prefix backups/ --max-items 1
+```
+
+### 2.1.2 Google Cloud Storage
+
+Upload role (custom role or `roles/storage.objectCreator` scoped to the bucket):
+
+```yaml
+# gcs-upload-role.yaml — bind to the backup service account on the bucket only
+title: BackupUpload
+description: Write backup objects and abort interrupted uploads
+stage: GA
+includedPermissions:
+  - storage.objects.create
+  - storage.multipartUploads.abort
+```
+
+Pruning role:
+
+```yaml
+# gcs-prune-role.yaml — bind to the retention job service account
+title: BackupPrune
+description: List and delete expired backup objects
+stage: GA
+includedPermissions:
+  - storage.objects.list
+  - storage.objects.delete
+  - storage.multipartUploads.list
+```
+
+Restore role (`roles/storage.objectViewer` on the bucket is sufficient):
+
+```yaml
+# gcs-restore-role.yaml — bind to the on-call / verify service account
+title: BackupRestore
+description: Read backup objects and list the bucket
+stage: GA
+includedPermissions:
+  - storage.objects.get
+  - storage.objects.list
+```
+
+Verify the bucket IAM policy (no credentials are printed):
+
+```bash
+gcloud storage buckets get-iam-policy "gs://${BACKUP_STORAGE_BUCKET}" \
+  --format='table(bindings.role,bindings.members)'
+
+# Confirm which identity the current session uses
+gcloud auth list --filter=status:ACTIVE --format='value(account)'
+```
+
+### 2.1.3 Azure Blob Storage
+
+Assign built-in roles at the **container** scope where possible:
+
+| Scope | Built-in role | Notes |
+| --- | --- | --- |
+| Upload | `Storage Blob Data Contributor` on the container | Needed for `Put Blob`/`Put Block` and aborting uncommitted blocks |
+| Pruning | `Storage Blob Data Contributor` on the container, held only by the retention job | Adds list + delete |
+| Restore | `Storage Blob Data Reader` on the container | Read/list only |
+
+If a custom role is required, the minimum data actions are:
+
+```json
+{
+  "Name": "BackupUpload",
+  "Actions": [],
+  "DataActions": [
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"
+  ],
+  "AssignableScopes": ["/subscriptions/<subscription-id>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<account>/blobServices/default/containers/<container>"]
+}
+```
+
+```json
+{
+  "Name": "BackupPrune",
+  "Actions": [],
+  "DataActions": [
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/delete",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/list/action"
+  ],
+  "AssignableScopes": ["/subscriptions/<subscription-id>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<account>/blobServices/default/containers/<container>"]
+}
+```
+
+```json
+{
+  "Name": "BackupRestore",
+  "Actions": [],
+  "DataActions": [
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/list/action"
+  ],
+  "AssignableScopes": ["/subscriptions/<subscription-id>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<account>/blobServices/default/containers/<container>"]
+}
+```
+
+Verify container permissions and role assignments:
+
+```bash
+# Container-level permissions for the current identity
+az storage container show-permissions \
+  --name "$BACKUP_STORAGE_CONTAINER" \
+  --account-name "$BACKUP_STORAGE_ACCOUNT" \
+  --auth-mode login
+
+# Role assignments scoped to the container (shows principals, not secrets)
+az role assignment list \
+  --scope "/subscriptions/<subscription-id>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/$BACKUP_STORAGE_ACCOUNT/blobServices/default/containers/$BACKUP_STORAGE_CONTAINER" \
+  --query '[].{role:roleDefinitionName,principal:principalName}' \
+  --output table
+```
+
+### 2.1.4 Verification checklist
+
+- [ ] Upload, pruning and restore each use a distinct credential/role.
+- [ ] The upload credential cannot list or delete objects (expect `AccessDenied`).
+- [ ] The restore credential cannot write or delete objects (expect `AccessDenied`).
+- [ ] The pruning credential is not available to the backup or restore jobs.
+- [ ] Verification commands read bucket/account names from environment variables; no keys, tokens or account IDs are committed.
+- [ ] The `BACKUP_STORAGE_*` variables used above are documented in [`docs/ENVIRONMENT-VARIABLES.md`](./ENVIRONMENT-VARIABLES.md).
+
 ## 3. Retention Policy
 
 - Backups are retained according to the lifecycle policy on the backup bucket (recommended: 30 days for daily backups). The scripts never delete old backups.
