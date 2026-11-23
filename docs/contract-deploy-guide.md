@@ -20,11 +20,24 @@ This guide walks through deploying the Soroban contracts and wiring up the backe
 cp contract-ids.env "contract-ids.env.$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
 
 # 3. Deploy all contracts (uploads WASM, deploys, calls init(admin), verifies,
-#    writes contract-ids.env). Add --dry-run to run only the pre-flight checks.
+#    writes contract-ids.env). Add --dry-run to run only the pre-flight checks,
+#    or --plan for a read-only report that never signs or submits anything.
 STELLAR_SECRET_KEY=S... \
 ADMIN_PUBLIC_KEY=G...   `# optional; defaults to the deployer` \
 CONTRACTS_WASM_DIR=../contracts/target/wasm32-unknown-unknown/release \
 npm run deploy:contracts -- --network testnet
+
+# Same, with explicit fee ceilings and a bounded confirmation deadline
+STELLAR_SECRET_KEY=S... \
+CONTRACTS_WASM_DIR=../contracts/target/wasm32-unknown-unknown/release \
+npm run deploy:contracts -- --network testnet \
+  --max-fee 0.5 --max-total-fee 5 --confirm-timeout 180000
+# Preview what would happen without touching the network (no signing, no
+# submission, secrets masked in the output):
+npm run deploy:contracts -- --network testnet --plan
+
+# Deploy with checksum validation against a build manifest:
+npm run deploy:contracts -- --network testnet --manifest build-manifest.json
 
 # Roll back: point the backend at a previous set of contract IDs
 npm run rollback:contracts -- --backup contract-ids.env.<timestamp> \
@@ -35,6 +48,127 @@ The deploy script performs pre-flight checks (valid key, funded account, WASM
 present), deploys `vault-registry`, `access-lease` and `subscription`,
 initialises each with `init(admin)`, and writes the resulting contract IDs to
 `contract-ids.env`. Mainnet requires typing a confirmation, or `--yes` in CI.
+
+### Fee ceilings
+
+Before signing anything, the script simulates each transaction and compares the
+estimated fee against operator-supplied ceilings:
+
+| Flag | Env equivalent | Meaning | Default |
+| --- | --- | --- | --- |
+| `--max-fee <XLM>` | `MAX_FEE_XLM` | Maximum fee for a single transaction | none (unbounded) |
+| `--max-total-fee <XLM>` | `MAX_TOTAL_FEE_XLM` | Maximum cumulative fee across the whole deploy run | none (unbounded) |
+
+```bash
+# Per-transaction ceiling only
+npm run deploy:contracts -- --network testnet --max-fee 0.5
+
+# Total budget for the run, supplied via the environment
+MAX_TOTAL_FEE_XLM=5 npm run deploy:contracts -- --network testnet
+```
+
+If a simulated fee exceeds either ceiling, the script **stops before signing**
+and reports the estimated cost, e.g.:
+
+```
+Fee ceiling exceeded: estimated 0.7341 XLM for transaction "upload vault-registry"
+exceeds --max-fee 0.5 XLM. Nothing was signed.
+```
+
+The total ceiling is checked against the running sum of simulated fees, so a
+run that stays under the per-transaction limit can still be halted once the
+cumulative estimate would exceed `--max-total-fee`.
+
+### RPC network identity verification
+
+Before signing, the script queries the configured `SOROBAN_RPC_URL` for its
+reported network identity (network passphrase) and compares it with the
+passphrase implied by `--network` (and the selected network configuration). If
+they disagree — for example a mainnet RPC URL passed with `--network testnet` —
+the run fails **before any transaction is submitted**:
+
+```
+RPC network mismatch: endpoint reports "Public Global Stellar Network ; September 2015"
+but --network testnet expects "Test SDF Network ; September 2015".
+Refusing to sign. Check SOROBAN_RPC_URL.
+```
+
+This guards against accidentally signing testnet transactions against a mainnet
+endpoint (or vice versa) when `SOROBAN_RPC_URL` is overridden.
+
+### Confirmation deadline
+
+Confirmation polling is bounded by an overall deadline rather than a fixed
+number of attempts:
+
+| Flag | Env equivalent | Meaning | Default |
+| --- | --- | --- | --- |
+| `--confirm-timeout <ms>` | `CONFIRM_TIMEOUT_MS` | Overall deadline for each confirmation loop | 120000 (2 minutes) |
+
+```bash
+# Give slow networks more time
+npm run deploy:contracts -- --network testnet --confirm-timeout 300000
+```
+
+If a transaction is still pending when the deadline elapses, the script stops
+polling (so CI cannot hang indefinitely) and exits with an error that includes
+the **transaction hash**, so the transaction can be reconciled later:
+
+```
+Timed out after 120000ms waiting for confirmation of transaction <tx-hash>.
+The transaction may still be pending; check it on the explorer before retrying.
+```
+
+Re-running the deploy after a timeout is safe to inspect first: look up the
+reported hash to see whether the transaction landed before deploying again.
+### Build manifest and checksum validation
+
+Pass `--manifest <path>` to validate every WASM artifact against expected
+SHA-256 checksums **before any deployment transaction is signed**. The manifest
+is a JSON object mapping artifact file names to their expected lowercase hex
+SHA-256 digest:
+
+```json
+{
+  "vault_registry.wasm": "3f2a...e91c",
+  "access_lease.wasm": "9b04...77d2",
+  "subscription.wasm": "c1d8...0a5f"
+}
+```
+
+Generate the digests from a trusted build (e.g. `sha256sum *.wasm` in the
+release directory) and commit the manifest alongside the audited commit SHA.
+If an artifact is missing from the manifest, or its digest does not match, the
+deploy aborts with a clear error before anything is signed or submitted.
+
+### Deployment record and post-deployment hash verification
+
+After a successful deploy the script writes a deployment record (JSON) that
+includes, for each contract, the `artifactHash` (SHA-256 of the local WASM that
+was uploaded) and the `onChainHash` (the executable hash reported by the
+network for the deployed contract). To verify a deployment later, re-run the
+script with the verification flag (or the dedicated verification workflow) and
+it will re-read the on-chain executable hashes and compare them against the
+recorded values. A mismatch means the deployed contract no longer corresponds
+to the artifact you recorded — investigate before pointing the backend at it.
+Keep the deployment record with the release notes for audit purposes.
+
+### Concurrency guard
+
+The script takes a lockfile keyed by network and signer public key so two
+deployments using the same Stellar account cannot run at the same time and
+silently race account sequence numbers. If a lock is already held, the second
+run exits with an error naming the lock file. Stale locks (e.g. from a crashed
+run) are detected and reported; remove the lock file only after confirming no
+deployment is still in flight. Do not run concurrent deployments with the same
+signer — use a separate funded account per concurrent deployment.
+
+### Read-only plan mode
+
+`--plan` prints the selected network, artifact hashes, signer public key and
+the planned contract operations (upload/deploy/init) without signing or
+submitting any transaction. Secret material (secret keys, seeds) is masked in
+the output, so plan mode is safe to run in shared logs and CI.
 
 Soroban contracts are immutable, so rollback never removes anything on-chain:
 it verifies that each contract in the backup file still exists on-chain, then
@@ -189,9 +323,25 @@ While the quickstart steps below focus on **Testnet**, deploying to **Stellar Ma
   and matches the expected public key.
 - **Balance check** — confirms the deployer account holds enough XLM to cover
   upload and deployment fees.
+- **Fee ceiling check** — simulates each transaction and refuses to sign if the
+  estimated fee exceeds `--max-fee` / `MAX_FEE_XLM` (per transaction) or
+  `--max-total-fee` / `MAX_TOTAL_FEE_XLM` (cumulative), reporting the estimate.
+- **RPC network identity check** — compares the network passphrase reported by
+  `SOROBAN_RPC_URL` with the selected `--network` and aborts before submission
+  on a mismatch.
+- **Confirmation deadline** — bounds confirmation polling by
+  `--confirm-timeout` / `CONFIRM_TIMEOUT_MS` (default 120000 ms) and reports the
+  transaction hash if the deadline is reached.
 - **WASM hash check** — builds the contracts and compares the resulting WASM hashes
-  against the recorded hashes to detect unintended changes.
+  against the recorded hashes to detect unintended changes. Pass
+  `--manifest build-manifest.json` to enforce the audited SHA-256 checksums; a
+  modified artifact aborts before any transaction is signed.
 - **Contract ID check** — warns if any target contract ID already exists on-chain.
+- **Concurrency guard** — refuses to run if another deployment with the same
+  signer and network holds the lock, preventing sequence-number races.
+- **Plan mode** — run `--plan` first to review the network, artifact hashes,
+  signer public key and planned operations without signing or submitting
+  anything (secrets are masked).
 - **Confirmation prompt** — prints a summary of the network, deployer, contract IDs
   and WASM hashes, then requires you to type `deploy mainnet` (or pass `--yes` in CI) to proceed.
 
@@ -389,5 +539,8 @@ If the contract `admin` key or the backend signing key (`BACKEND_SECRET` / `STEL
 | `account not found` | Fund the account with Friendbot first |
 | `Error: wasm too large` | Run with `--release` flag |
 | `insufficient balance` | Fund deployer wallet — needs XLM for fees |
+| `Fee ceiling exceeded` | Raise `--max-fee` / `--max-total-fee` (or the env equivalents) after reviewing the reported estimate |
+| `RPC network mismatch` | Point `SOROBAN_RPC_URL` at an endpoint for the selected `--network` |
+| `Timed out ... waiting for confirmation` | Look up the reported transaction hash; raise `--confirm-timeout` / `CONFIRM_TIMEOUT_MS` if the network is slow |
 | `contract already exists` | Use `--wasm-hash` flag to reuse existing upload |
 | `Error: HostError: Value(InvalidInput)` | Check argument types match contract signature |

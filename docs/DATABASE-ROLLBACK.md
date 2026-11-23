@@ -299,10 +299,185 @@ Verification steps before dropping the old column:
 
 ---
 
+## 6. Recovering from an Interrupted Migration
+
+A migration can be interrupted by a pod eviction, a lost database connection, a
+timeout, or a failed `backend-migrate` Job. When that happens the database may be
+in a *partially applied* state: some statements committed, others not, and the
+`drizzle.__drizzle_migrations` table may or may not record the migration.
+
+Do **not** simply re-run `drizzle-kit migrate` and hope for the best. First
+determine the actual state, then choose retry, repair, or restore.
+
+### 6.1 Inspect the migration state
+
+**a) Check the migration Job and pod status** (Kubernetes deployments):
+
+```bash
+# Job status: completions, failures, and conditions
+kubectl get jobs -l app=backend-migrate -o wide
+kubectl describe job backend-migrate
+
+# Pods created by the Job (including failed/terminated ones)
+kubectl get pods -l job-name=backend-migrate -o wide
+
+# Logs from the most recent attempt (add --previous for the crashed container)
+kubectl logs -l job-name=backend-migrate --tail=200
+kubectl logs -l job-name=backend-migrate --previous --tail=200
+```
+
+The Job manifest lives at [`k8s/backend-migrate-job.yaml`](../k8s/backend-migrate-job.yaml).
+Look for `BackoffLimitExceeded`, `DeadlineExceeded`, or a container that exited
+non-zero mid-migration. The last log lines usually name the statement that failed.
+
+**b) Check what Drizzle recorded as applied:**
+
+```bash
+psql "$DATABASE_URL" -c "SELECT id, hash, created_at FROM drizzle.__drizzle_migrations ORDER BY created_at;"
+```
+
+Compare this against the local migration files:
+
+```bash
+ls -1 drizzle/*.sql
+```
+
+The newest local migration should be the last row in the table. If it is
+missing, the migration did not complete its bookkeeping — but its SQL may still
+have partially run.
+
+**c) Check for partial application.** Drizzle runs each migration file's
+statements without an enclosing transaction by default, so a failure partway
+through leaves earlier statements committed. Inspect the objects the interrupted
+migration was supposed to create or alter:
+
+```bash
+# Example: did the table/column/index from the migration get created?
+psql "$DATABASE_URL" -c "\d+ <table_from_migration>"
+psql "$DATABASE_URL" -c "SELECT indexname FROM pg_indexes WHERE tablename = '<table_from_migration>';"
+psql "$DATABASE_URL" -c "SELECT conname FROM pg_constraint WHERE conrelid = '<table_from_migration>'::regclass;"
+```
+
+Also check for locks or long-running transactions left behind by the killed pod:
+
+```bash
+psql "$DATABASE_URL" -c "SELECT pid, state, query, now() - query_start AS age FROM pg_stat_activity WHERE state <> 'idle' ORDER BY age DESC;"
+```
+
+If a stale transaction is holding locks, terminate it before proceeding:
+
+```bash
+psql "$DATABASE_URL" -c "SELECT pg_terminate_backend(<pid>);"
+```
+
+### 6.2 Decide: retry, repair, or restore
+
+Use this decision tree after inspecting the state above:
+
+1. **Migration not recorded and no partial changes detected** → **Retry.**
+   The migration did not take effect. Re-run it (see 6.3).
+
+2. **Migration not recorded but partial changes detected** → **Repair.**
+   Some statements committed. Either finish the remaining statements manually
+   and insert the migration row, or reverse the partial changes and retry
+   cleanly (see 6.4).
+
+3. **Migration recorded but the schema is inconsistent** (e.g. the row was
+   inserted but a later statement failed) → **Repair.** Reconcile the schema
+   with the migration file, then verify (see 6.4).
+
+4. **Partial changes cannot be cleanly reversed, or data was corrupted** →
+   **Restore** from a Supabase point-in-time backup (see section 4), then
+   re-apply migrations.
+
+When in doubt, prefer **restore** over ad-hoc SQL edits — it is the most
+predictable outcome.
+
+### 6.3 Retry
+
+If nothing was applied, re-run the migration through the normal path:
+
+```bash
+# Locally / CI
+npx drizzle-kit migrate
+
+# Kubernetes: delete the failed Job and re-apply the manifest
+kubectl delete job backend-migrate --ignore-not-found
+kubectl apply -f k8s/backend-migrate-job.yaml
+kubectl wait --for=condition=complete job/backend-migrate --timeout=10m
+```
+
+Confirm the migration row now exists (6.1b) before resuming traffic.
+
+### 6.4 Repair
+
+For a partially applied migration, choose one of:
+
+- **Finish forward:** apply the remaining statements from the migration file by
+  hand, then record the migration so Drizzle does not re-run it:
+
+  ```bash
+  psql "$DATABASE_URL" -f drizzle/<migration>.sql   # only the missing statements
+  psql "$DATABASE_URL" -c "INSERT INTO drizzle.__drizzle_migrations (hash, created_at) VALUES ('<hash>', <epoch_ms>);"
+  ```
+
+  Take the `hash` and `created_at` values from the migration's entry in
+  `drizzle/meta/_journal.json` so they match what Drizzle expects.
+
+- **Reverse and retry:** undo the partial changes with a reverse SQL file, then
+  retry the migration. Use [`scripts/db-rollback.sh`](../scripts/db-rollback.sh)
+  to apply the reverse SQL and clean up the migration row in one transaction:
+
+  ```bash
+  DATABASE_URL=... ./scripts/db-rollback.sh --file drizzle/9999_repair_partial.sql --dry-run
+  DATABASE_URL=... ./scripts/db-rollback.sh --file drizzle/9999_repair_partial.sql --env production
+  ```
+
+  Then retry per 6.3.
+
+### 6.5 Staging exercise
+
+Rehearse the recovery path in staging before relying on it in production:
+
+- [ ] Deploy the `backend-migrate` Job to staging with a migration that is
+      known to fail partway (e.g. a deliberate constraint violation on the
+      second statement).
+- [ ] Confirm the Job reports failure and capture its logs.
+- [ ] Run the inspection queries in 6.1 and record the observed state.
+- [ ] Walk the decision tree in 6.2 and document which path you chose and why.
+- [ ] Execute the chosen retry/repair/restore path end to end.
+- [ ] Complete the pre-traffic checks in 6.6.
+- [ ] Repeat for at least one retry and one restore scenario.
+
+### 6.6 Pre-traffic verification before resuming
+
+Do not route application traffic back until every item passes:
+
+- [ ] **Migration table consistency:** the newest local migration is the last
+      row in `drizzle.__drizzle_migrations`, with no duplicates or gaps:
+      `psql "$DATABASE_URL" -c "SELECT id, hash, created_at FROM drizzle.__drizzle_migrations ORDER BY created_at;"`
+- [ ] **Schema matches migrations:** `npx drizzle-kit check` (or `drizzle-kit
+      generate` producing no diff) reports no pending changes.
+- [ ] **Objects present:** expected tables, columns, constraints, and indexes
+      exist (spot-check with `\d+` and the `pg_indexes`/`pg_constraint` queries
+      in 6.1c).
+- [ ] **No stale locks:** `pg_stat_activity` shows no long-running or idle-in-
+      transaction sessions from the failed migration.
+- [ ] **Application starts** and connects successfully against the recovered
+      database.
+- [ ] **Smoke tests pass:** auth, core read paths, and core write paths.
+- [ ] **Logs clean:** no migration- or schema-related errors in application or
+      database logs.
+- [ ] **Stakeholders notified** that traffic is resuming.
+
+---
+
 ## Notes
 
 - Always run migrations and rollbacks against a staging environment first.
 - Sequence schema changes with expand-and-contract (section 5) so old and new
   backend versions stay compatible during rolling deployments.
+- Rehearse interrupted-migration recovery (section 6.5) in staging before
+  relying on it in production.
 - Keep reverse SQL scripts in version control alongside the forward migrations.
 - If unsure, prefer restoring from a Supabase backup over ad-hoc SQL edits.

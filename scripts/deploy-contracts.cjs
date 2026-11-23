@@ -30,7 +30,9 @@
  *                         to the deployer's public key.
  */
 
+const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const readline = require('readline');
 
@@ -95,6 +97,13 @@ function contractEnvName(contractName) {
 // 10 XLM accommodates uploading 3 WASM contracts (each ~300-500KB).
 const MIN_BALANCE_STROOPS = 100_000_000n; // 10 XLM
 
+// Default fee ceilings (in stroops). 1 XLM = 10,000,000 stroops.
+const DEFAULT_MAX_FEE_STROOPS = 10_000_000n; // 1 XLM per transaction
+const DEFAULT_MAX_TOTAL_FEE_STROOPS = 100_000_000n; // 10 XLM across all transactions
+
+// Default overall deadline for a single transaction confirmation.
+const DEFAULT_CONFIRM_TIMEOUT_MS = 120_000; // 2 minutes
+
 // ---------------------------------------------------------------------------
 // CLI argument parsing
 // ---------------------------------------------------------------------------
@@ -116,11 +125,20 @@ function parseArgs(argv) {
     minInstanceTtl: null,
     minCodeTtl: null,
     ttlFailMode: null,
+    maxFee: null,
+    maxTotalFee: null,
+    confirmTimeoutMs: null,
+    plan: false,
+    manifest: null,
+    verifyRecord: null,
   };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--dry-run') {
+      args.dryRun = true;
+    } else if (arg === '--plan') {
+      args.plan = true;
       args.dryRun = true;
     } else if (arg === '--yes' || arg === '-y') {
       args.yes = true;
@@ -132,6 +150,22 @@ function parseArgs(argv) {
       args.wasmDir = value;
     } else if (arg.startsWith('--wasm-dir=')) {
       args.wasmDir = arg.slice('--wasm-dir='.length);
+    } else if (arg === '--manifest') {
+      const value = argv[++i];
+      if (!value) {
+        throw new Error('--manifest requires a value');
+      }
+      args.manifest = value;
+    } else if (arg.startsWith('--manifest=')) {
+      args.manifest = arg.slice('--manifest='.length);
+    } else if (arg === '--verify-record') {
+      const value = argv[++i];
+      if (!value) {
+        throw new Error('--verify-record requires a value');
+      }
+      args.verifyRecord = value;
+    } else if (arg.startsWith('--verify-record=')) {
+      args.verifyRecord = arg.slice('--verify-record='.length);
     } else if (arg === '--network') {
       const value = argv[++i];
       if (!value) {
@@ -167,6 +201,30 @@ function parseArgs(argv) {
       args.ttlFailMode = value;
     } else if (arg.startsWith('--ttl-fail-mode=')) {
       args.ttlFailMode = arg.slice('--ttl-fail-mode='.length);
+    } else if (arg === '--max-fee') {
+      const value = argv[++i];
+      if (!value) {
+        throw new Error('--max-fee requires a value (in stroops)');
+      }
+      args.maxFee = value;
+    } else if (arg.startsWith('--max-fee=')) {
+      args.maxFee = arg.slice('--max-fee='.length);
+    } else if (arg === '--max-total-fee') {
+      const value = argv[++i];
+      if (!value) {
+        throw new Error('--max-total-fee requires a value (in stroops)');
+      }
+      args.maxTotalFee = value;
+    } else if (arg.startsWith('--max-total-fee=')) {
+      args.maxTotalFee = arg.slice('--max-total-fee='.length);
+    } else if (arg === '--confirm-timeout') {
+      const value = argv[++i];
+      if (!value) {
+        throw new Error('--confirm-timeout requires a value (in milliseconds)');
+      }
+      args.confirmTimeoutMs = value;
+    } else if (arg.startsWith('--confirm-timeout=')) {
+      args.confirmTimeoutMs = arg.slice('--confirm-timeout='.length);
     } else if (arg === '--help' || arg === '-h') {
       printUsage();
       process.exit(0);
@@ -196,6 +254,11 @@ Options:
                                          For local Stellar/Quickstart node, set SOROBAN_RPC_URL.
   --wasm-dir <dir>                       Directory containing the built contract *.wasm files
                                          (defaults to $CONTRACTS_WASM_DIR, then ./target/wasm32-unknown-unknown/release).
+  --manifest <path>                      JSON manifest mapping WASM artifact filenames to expected
+                                         SHA-256 checksums. Artifacts are validated before any
+                                         transaction is signed.
+  --verify-record <path>                 Re-read a deployment record, fetch current on-chain
+                                         executable hashes, and report mismatches (read-only).
   --yes, -y                              Skip the interactive mainnet confirmation (for CI).
   --dry-run                              Perform all checks without submitting transactions.
   --min-instance-ttl <ledgers>           Warn when a contract instance's remaining TTL is below this
@@ -204,6 +267,15 @@ Options:
                                          value (defaults to $MIN_CODE_TTL_LEDGERS, then ${DEFAULT_MIN_CODE_TTL_LEDGERS}).
   --ttl-fail-mode <warn|fail>            Behavior when remaining TTL drops below the hard floor
                                          (${DEFAULT_TTL_HARD_FLOOR_LEDGERS} ledgers). Defaults to "fail".
+  --max-fee <stroops>                    Maximum fee (in stroops) allowed for any single
+                                         transaction (defaults to $MAX_FEE, then 10000000).
+  --max-total-fee <stroops>              Maximum cumulative fee (in stroops) allowed across
+                                         all transactions (defaults to $MAX_TOTAL_FEE, then 100000000).
+  --confirm-timeout <ms>                 Overall deadline for each transaction confirmation
+                                         (defaults to $CONFIRM_TIMEOUT_MS, then 120000).
+  --plan                                 Read-only planning mode: report network, artifact hashes,
+                                         signer public key and planned operations without signing
+                                         or submitting anything (implies --dry-run).
   --help, -h                             Show this help message.
 `);
 }
@@ -278,6 +350,21 @@ function validateEnv(args) {
       ? parsePositiveInt(process.env.MIN_CODE_TTL_LEDGERS, 'MIN_CODE_TTL_LEDGERS')
       : DEFAULT_MIN_CODE_TTL_LEDGERS);
   const ttlFailMode = args.ttlFailMode || 'fail';
+  const maxFee = parseStroopLimit(
+    args.maxFee ?? process.env.MAX_FEE,
+    DEFAULT_MAX_FEE_STROOPS,
+    'MAX_FEE'
+  );
+  const maxTotalFee = parseStroopLimit(
+    args.maxTotalFee ?? process.env.MAX_TOTAL_FEE,
+    DEFAULT_MAX_TOTAL_FEE_STROOPS,
+    'MAX_TOTAL_FEE'
+  );
+  const confirmTimeoutMs = parsePositiveInt(
+    args.confirmTimeoutMs ?? process.env.CONFIRM_TIMEOUT_MS,
+    DEFAULT_CONFIRM_TIMEOUT_MS,
+    'CONFIRM_TIMEOUT_MS'
+  );
 
   return {
     keypair,
@@ -288,7 +375,229 @@ function validateEnv(args) {
     minInstanceTtl,
     minCodeTtl,
     ttlFailMode,
+    maxFee,
+    maxTotalFee,
+    confirmTimeoutMs,
   };
+}
+
+function parseStroopLimit(raw, fallback, name) {
+  if (raw === undefined || raw === null || raw === '') {
+    return fallback;
+  }
+  const value = String(raw).trim();
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`${name} must be a non-negative integer number of stroops, got: ${raw}`);
+  }
+  return BigInt(value);
+}
+
+function parsePositiveInt(raw, fallback, name) {
+  if (raw === undefined || raw === null || raw === '') {
+    return fallback;
+  }
+  const value = String(raw).trim();
+  if (!/^\d+$/.test(value) || Number(value) <= 0) {
+    throw new Error(`${name} must be a positive integer number of milliseconds, got: ${raw}`);
+  }
+  return Number(value);
+}
+
+// ---------------------------------------------------------------------------
+// Build manifest / artifact checksums
+// ---------------------------------------------------------------------------
+
+/**
+ * Load an optional build manifest mapping WASM artifact filenames (or paths)
+ * to expected SHA-256 checksums. Returns null when no manifest is configured.
+ *
+ * Accepted shapes:
+ *   { "vault_registry.wasm": "<sha256 hex>", ... }
+ *   { "artifacts": { "vault_registry.wasm": "<sha256 hex>" } }
+ *   { "artifacts": [ { "file": "vault_registry.wasm", "sha256": "<hex>" } ] }
+ */
+function loadManifest(manifestPath) {
+  if (!manifestPath) return null;
+
+  const resolved = path.resolve(manifestPath);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Build manifest not found: ${resolved}`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+  } catch (err) {
+    throw new Error(`Build manifest is not valid JSON (${resolved}): ${err.message}`);
+  }
+
+  const entries = new Map();
+  const addEntry = (file, checksum) => {
+    if (typeof file !== 'string' || typeof checksum !== 'string') {
+      throw new Error(`Build manifest entry must map a filename to a checksum string: ${file}`);
+    }
+    const normalized = checksum.trim().toLowerCase().replace(/^sha256:/, '');
+    if (!/^[0-9a-f]{64}$/.test(normalized)) {
+      throw new Error(`Build manifest checksum for "${file}" is not a valid SHA-256 hex digest`);
+    }
+    entries.set(path.basename(file), normalized);
+  };
+
+  const source = parsed && parsed.artifacts ? parsed.artifacts : parsed;
+  if (Array.isArray(source)) {
+    for (const item of source) {
+      if (!item || typeof item !== 'object') {
+        throw new Error('Build manifest artifact entries must be objects');
+      }
+      addEntry(item.file || item.name, item.sha256 || item.checksum);
+    }
+  } else if (source && typeof source === 'object') {
+    for (const [file, checksum] of Object.entries(source)) {
+      addEntry(file, checksum);
+    }
+  } else {
+    throw new Error(`Build manifest has an unsupported shape: ${resolved}`);
+  }
+
+  return { path: resolved, entries };
+}
+
+function hashWasmFile(wasmPath) {
+  const data = fs.readFileSync(wasmPath);
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+/**
+ * Validate every artifact against the manifest. Throws before any transaction
+ * is built or signed when an artifact is missing from the manifest or its
+ * checksum does not match.
+ */
+function validateManifest(manifest, contracts) {
+  if (!manifest) {
+    log.warn('No build manifest provided; skipping artifact checksum validation.');
+    return {};
+  }
+
+  log.step('Validating artifact checksums against build manifest');
+  const hashes = {};
+  const problems = [];
+
+  for (const contract of contracts) {
+    const expected = manifest.entries.get(path.basename(contract.wasmFile));
+    if (!expected) {
+      problems.push(`"${contract.name}" (${contract.wasmFile}) is missing from the build manifest`);
+      continue;
+    }
+    if (!fs.existsSync(contract.wasm)) {
+      problems.push(`"${contract.name}" WASM file not found: ${contract.wasm}`);
+      continue;
+    }
+    const actual = hashWasmFile(contract.wasm);
+    hashes[contract.name] = actual;
+    if (actual !== expected) {
+      problems.push(
+        `"${contract.name}" checksum mismatch: expected ${expected}, got ${actual} (${contract.wasm})`
+      );
+    } else {
+      log.ok(`Checksum verified for "${contract.name}": ${actual}`);
+    }
+  }
+
+  if (problems.length > 0) {
+    throw new Error(
+      `Artifact checksum validation failed; refusing to sign any deployment transaction:\n  - ${problems.join('\n  - ')}`
+    );
+  }
+
+  return hashes;
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency guard (lockfile keyed by network + signer)
+// ---------------------------------------------------------------------------
+
+const LOCK_STALE_MS = 30 * 60 * 1000; // 30 minutes
+
+function lockFilePath(network, publicKey) {
+  return path.join(ROOT_DIR, `.deploy-lock-${network}-${publicKey}.lock`);
+}
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
+/**
+ * Acquire an exclusive deployment lock for the given network + signer.
+ * Fails fast when another live deployment holds the lock. Stale locks (dead
+ * PID or older than LOCK_STALE_MS) are reclaimed.
+ */
+function acquireLock(network, publicKey) {
+  const file = lockFilePath(network, publicKey);
+  const payload = JSON.stringify({
+    pid: process.pid,
+    hostname: os.hostname(),
+    network,
+    publicKey,
+    timestamp: new Date().toISOString(),
+  });
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(file, 'wx');
+      fs.writeSync(fd, payload);
+      fs.closeSync(fd);
+      log.ok(`Acquired deployment lock ${path.basename(file)}`);
+      return file;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+
+      let existing = null;
+      try {
+        existing = JSON.parse(fs.readFileSync(file, 'utf8'));
+      } catch (_) {
+        existing = null;
+      }
+
+      const age = existing && existing.timestamp ? Date.now() - Date.parse(existing.timestamp) : Infinity;
+      const alive = existing ? isProcessAlive(existing.pid) : false;
+      const stale = !existing || !alive || age > LOCK_STALE_MS;
+
+      if (!stale) {
+        throw new Error(
+          `Another deployment holds the lock for ${network} / ${publicKey} ` +
+            `(pid ${existing.pid}, host ${existing.hostname || 'unknown'}, since ${existing.timestamp}). ` +
+            `Wait for it to finish or remove ${file} if it is stale.`
+        );
+      }
+
+      log.warn(`Reclaiming stale deployment lock ${path.basename(file)}`);
+      try {
+        fs.unlinkSync(file);
+      } catch (unlinkErr) {
+        if (unlinkErr.code !== 'ENOENT') throw unlinkErr;
+      }
+    }
+  }
+
+  throw new Error(`Unable to acquire deployment lock ${file}`);
+}
+
+function releaseLock(file) {
+  if (!file) return;
+  try {
+    fs.unlinkSync(file);
+    log.info(`Released deployment lock ${path.basename(file)}`);
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      log.warn(`Failed to release deployment lock ${file}: ${err.message}`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -323,11 +632,63 @@ function confirmMainnet(network, assumeYes) {
 }
 
 // ---------------------------------------------------------------------------
+// Network identity verification
+// ---------------------------------------------------------------------------
+
+/**
+ * Compare the RPC-reported network identity with the selected network's
+ * passphrase. Fails fast (before any signing/submission) on mismatch.
+ */
+async function verifyNetworkIdentity({ server, network, networkPassphrase }) {
+  log.step('Verifying RPC network identity');
+
+  const expected = networkPassphrase || NETWORK_PASSPHRASES[network];
+  if (!expected) {
+    throw new Error(`No network passphrase configured for "${network}"`);
+  }
+
+  let reported = null;
+  if (typeof server.getNetwork === 'function') {
+    try {
+      const info = await server.getNetwork();
+      reported = info && (info.passphrase || info.networkPassphrase || null);
+    } catch (err) {
+      throw new Error(`Unable to query RPC network identity: ${err.message}`);
+    }
+  } else if (typeof server.getNetworkPassphrase === 'function') {
+    try {
+      reported = await server.getNetworkPassphrase();
+    } catch (err) {
+      throw new Error(`Unable to query RPC network identity: ${err.message}`);
+    }
+  }
+
+  if (!reported) {
+    throw new Error(
+      'RPC endpoint did not report a network passphrase; refusing to sign transactions against an unverified endpoint.'
+    );
+  }
+
+  if (reported !== expected) {
+    throw new Error(
+      `RPC network identity mismatch: endpoint reports "${reported}" but "${network}" expects "${expected}". ` +
+        'Refusing to sign or submit transactions against a mismatched endpoint.'
+    );
+  }
+
+  log.ok(`RPC network identity matches "${network}"`);
+  return reported;
+}
+
+// ---------------------------------------------------------------------------
 // Pre-flight checks
 // ---------------------------------------------------------------------------
 
-async function preflightChecks({ server, keypair, network, contracts, dryRun }) {
+async function preflightChecks({ server, keypair, network, contracts, dryRun, manifest }) {
   log.step('Running pre-flight checks');
+
+  // 0. Artifact checksum validation (before any transaction is signed).
+  validateManifest(manifest, contracts);
 
   // 1. Network passphrase sanity check.
   const networkPassphrase = NETWORK_PASSPHRASES[network];
@@ -388,13 +749,61 @@ async function preflightChecks({ server, keypair, network, contracts, dryRun }) 
 // Transaction helpers
 // ---------------------------------------------------------------------------
 
-async function submitTransaction({ server, tx, keypair, dryRun, label }) {
+/**
+ * Enforce the per-transaction and cumulative fee ceilings against the fee
+ * estimated by simulation (via prepareTransaction). Aborts before signing.
+ */
+function enforceFeeCeiling({ label, estimatedFee, maxFee, maxTotalFee, spentFee }) {
+  const fee = BigInt(estimatedFee);
+  const total = BigInt(spentFee) + fee;
+
+  if (maxFee !== null && maxFee !== undefined && fee > BigInt(maxFee)) {
+    throw new Error(
+      `Estimated fee for ${label} (${fee} stroops) exceeds the per-transaction ceiling ` +
+        `(--max-fee / MAX_FEE = ${maxFee} stroops). Aborting before signing.`
+    );
+  }
+
+  if (maxTotalFee !== null && maxTotalFee !== undefined && total > BigInt(maxTotalFee)) {
+    throw new Error(
+      `Estimated cumulative fee after ${label} (${total} stroops) exceeds the total ceiling ` +
+        `(--max-total-fee / MAX_TOTAL_FEE = ${maxTotalFee} stroops). Aborting before signing.`
+    );
+  }
+
+  return total;
+}
+
+async function submitTransaction({
+  server,
+  tx,
+  keypair,
+  dryRun,
+  label,
+  maxFee,
+  maxTotalFee,
+  feeTracker,
+  confirmTimeoutMs,
+}) {
   if (dryRun) {
     log.info(`[dry-run] Skipping submission: ${label}`);
     return null;
   }
 
   const prepared = await server.prepareTransaction(tx);
+
+  // Estimate the fee from the simulated/prepared transaction before signing.
+  const estimatedFee = BigInt(prepared.fee);
+  const spentFee = feeTracker ? feeTracker.spent : 0n;
+  const newTotal = enforceFeeCeiling({
+    label,
+    estimatedFee,
+    maxFee,
+    maxTotalFee,
+    spentFee,
+  });
+  log.info(`Estimated fee for ${label}: ${estimatedFee} stroops`);
+
   prepared.sign(keypair);
 
   const sendResponse = await server.sendTransaction(prepared);
@@ -405,9 +814,12 @@ async function submitTransaction({ server, tx, keypair, dryRun, label }) {
   }
 
   const hash = sendResponse.hash;
+  if (feeTracker) {
+    feeTracker.spent = newTotal;
+  }
   log.info(`Submitted ${label} (hash: ${hash}); awaiting confirmation...`);
 
-  const result = await pollTransaction(server, hash);
+  const result = await pollTransaction(server, hash, { timeoutMs: confirmTimeoutMs });
   if (result.status !== 'SUCCESS') {
     throw new Error(`Transaction ${hash} for ${label} did not succeed: ${result.status}`);
   }
@@ -416,22 +828,56 @@ async function submitTransaction({ server, tx, keypair, dryRun, label }) {
   return result;
 }
 
-async function pollTransaction(server, hash, { attempts = 30, intervalMs = 2000 } = {}) {
-  for (let i = 0; i < attempts; i++) {
+/**
+ * Poll for a transaction result until it is no longer NOT_FOUND or the overall
+ * deadline elapses. On timeout the error includes the hash and last status so
+ * operators can reconcile the transaction later.
+ */
+async function pollTransaction(
+  server,
+  hash,
+  { timeoutMs = DEFAULT_CONFIRM_TIMEOUT_MS, intervalMs = 2000 } = {}
+) {
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus = 'NOT_FOUND';
+
+  while (true) {
     const response = await server.getTransaction(hash);
+    lastStatus = response.status;
     if (response.status !== 'NOT_FOUND') {
       return response;
     }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, remaining)));
   }
-  throw new Error(`Timed out waiting for transaction ${hash}`);
+
+  throw new Error(
+    `Timed out after ${timeoutMs}ms waiting for transaction ${hash} ` +
+      `(last observed status: ${lastStatus}). ` +
+      'The transaction may still be pending; reconcile using this hash before retrying.'
+  );
 }
 
 // ---------------------------------------------------------------------------
 // WASM upload
 // ---------------------------------------------------------------------------
 
-async function uploadWasm({ server, keypair, networkPassphrase, wasmPath, dryRun, contractName }) {
+async function uploadWasm({
+  server,
+  keypair,
+  networkPassphrase,
+  wasmPath,
+  dryRun,
+  contractName,
+  maxFee,
+  maxTotalFee,
+  feeTracker,
+  confirmTimeoutMs,
+}) {
   log.step(`Uploading WASM for "${contractName}"`);
 
   const wasm = fs.readFileSync(wasmPath);
@@ -461,6 +907,10 @@ async function uploadWasm({ server, keypair, networkPassphrase, wasmPath, dryRun
     networkPassphrase,
     dryRun,
     label: `upload WASM for "${contractName}"`,
+    maxFee,
+    maxTotalFee,
+    feeTracker,
+    confirmTimeoutMs,
   });
 
   const wasmHash = result.returnValue
@@ -486,6 +936,10 @@ async function deployContract({
   wasmHash,
   dryRun,
   contractName,
+  maxFee,
+  maxTotalFee,
+  feeTracker,
+  confirmTimeoutMs,
 }) {
   log.step(`Deploying contract "${contractName}"`);
 
@@ -515,6 +969,10 @@ async function deployContract({
     networkPassphrase,
     dryRun,
     label: `deploy "${contractName}"`,
+    maxFee,
+    maxTotalFee,
+    feeTracker,
+    confirmTimeoutMs,
   });
 
   const contractId = scValToNative(result.returnValue);
@@ -538,6 +996,10 @@ async function initContract({
   adminAddress,
   dryRun,
   contractName,
+  maxFee,
+  maxTotalFee,
+  feeTracker,
+  confirmTimeoutMs,
 }) {
   log.step(`Initializing contract "${contractName}"`);
 
@@ -564,6 +1026,10 @@ async function initContract({
     networkPassphrase,
     dryRun,
     label: `init "${contractName}"`,
+    maxFee,
+    maxTotalFee,
+    feeTracker,
+    confirmTimeoutMs,
   });
 
   log.ok(`Initialized "${contractName}" with admin ${adminAddress}`);
@@ -572,6 +1038,20 @@ async function initContract({
 // ---------------------------------------------------------------------------
 // On-chain verification
 // ---------------------------------------------------------------------------
+
+async function fetchOnChainWasmHash(server, contractId) {
+  const ledgerEntries = await server.getContractData(
+    contractId,
+    xdr.ScVal.scvLedgerKeyContractInstance(),
+    rpc.Durability.Persistent
+  );
+  if (!ledgerEntries || !ledgerEntries.val) return null;
+
+  const executable = ledgerEntries.val.value?.executable;
+  const wasmHash = executable?.wasmHash ?? executable?.value?.();
+  if (!wasmHash) return null;
+  return Buffer.from(wasmHash).toString('hex');
+}
 
 async function verifyContract({ server, contractId, dryRun, contractName, expectedAdmin }) {
   log.step(`Verifying contract "${contractName}"`);
@@ -810,9 +1290,19 @@ function writeDeploymentRecord(
   deployer,
   txHashes,
   dryRun,
+  hashes = {},
   ttlObservations = {}
 ) {
   log.step('Writing deployment record');
+
+  const contractRecords = {};
+  for (const [name, id] of Object.entries(contractIds)) {
+    contractRecords[name] = {
+      contractId: id,
+      artifactHash: hashes[name]?.artifactHash ?? null,
+      onChainHash: hashes[name]?.onChainHash ?? null,
+    };
+  }
 
   const deploymentJson = {
     timestamp: new Date().toISOString(),
@@ -820,6 +1310,7 @@ function writeDeploymentRecord(
     deployer,
     adminAddress,
     contracts: contractIds,
+    contractHashes: contractRecords,
     transactionHashes: txHashes,
     ttl: ttlObservations,
     gitRef: process.env.GIT_REF || null,
@@ -836,6 +1327,105 @@ function writeDeploymentRecord(
 
   fs.writeFileSync(recordFile, content, { encoding: 'utf8' });
   log.ok(`Wrote deployment record to ${recordFile}`);
+  return recordFile;
+}
+
+/**
+ * Re-read a deployment record, fetch current on-chain executable hashes and
+ * compare them to the recorded values. Returns { ok, mismatches }.
+ */
+async function verifyDeploymentRecord({ server, recordPath }) {
+  log.step('Verifying deployment record against on-chain state');
+
+  const resolved = path.resolve(recordPath);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Deployment record not found: ${resolved}`);
+  }
+  const record = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+  const recorded = record.contractHashes || {};
+  const mismatches = [];
+
+  for (const [name, id] of Object.entries(record.contracts || {})) {
+    const expected = recorded[name]?.onChainHash || null;
+    let actual = null;
+    try {
+      actual = await fetchOnChainWasmHash(server, id);
+    } catch (err) {
+      mismatches.push(`${name} (${id}): unable to fetch on-chain hash (${err.message})`);
+      continue;
+    }
+
+    if (!expected) {
+      log.warn(`${name} (${id}): no recorded on-chain hash to compare`);
+      continue;
+    }
+    if (actual !== expected) {
+      mismatches.push(`${name} (${id}): recorded ${expected}, on-chain ${actual || 'unknown'}`);
+    } else {
+      log.ok(`${name} (${id}): on-chain hash matches record (${actual})`);
+    }
+  }
+
+  if (mismatches.length > 0) {
+    log.error('Deployment record verification failed:');
+    for (const m of mismatches) log.error(`  - ${m}`);
+    return { ok: false, mismatches };
+  }
+
+  log.ok('All recorded hashes agree with deployed contracts');
+  return { ok: true, mismatches };
+}
+
+// ---------------------------------------------------------------------------
+// Read-only planning mode
+// ---------------------------------------------------------------------------
+
+function maskSecret(value) {
+  if (!value) return '<unset>';
+  return `${value.slice(0, 4)}…${value.slice(-4)} (masked)`;
+}
+
+/**
+ * Report the resolved network, artifact hashes, signer public key and planned
+ * contract operations without signing or submitting anything. Never prints
+ * secret material.
+ */
+function planDeployment({ network, rpcUrl, contracts, keypair, adminAddress, manifest, existingIds = {} }) {
+  log.step('Deployment plan (read-only)');
+
+  const artifactHashes = {};
+  for (const contract of contracts) {
+    artifactHashes[contract.name] = fs.existsSync(contract.wasm)
+      ? hashWasmFile(contract.wasm)
+      : '<missing>';
+  }
+
+  const plan = {
+    network,
+    rpcUrl,
+    signerPublicKey: keypair.publicKey(),
+    secretKey: maskSecret(process.env.STELLAR_SECRET_KEY),
+    adminAddress,
+    manifest: manifest ? manifest.path : null,
+    artifacts: contracts.map((c) => ({
+      name: c.name,
+      wasm: c.wasm,
+      artifactHash: artifactHashes[c.name],
+      action: existingIds[c.name] ? 'skip (already deployed)' : 'upload + deploy + init',
+      existingContractId: existingIds[c.name] || null,
+    })),
+    plannedOperations: contracts
+      .filter((c) => !existingIds[c.name])
+      .flatMap((c) => [
+        `uploadContractWasm(${c.wasmFile})`,
+        `createCustomContract(${c.name})`,
+        `init(${adminAddress}) on ${c.name}`,
+      ]),
+  };
+
+  console.log(JSON.stringify(plan, null, 2));
+  log.warn('Plan mode: no transactions were signed or submitted.');
+  return plan;
 }
 
 // ---------------------------------------------------------------------------
@@ -854,6 +1444,9 @@ async function main() {
     minInstanceTtl,
     minCodeTtl,
     ttlFailMode,
+    maxFee,
+    maxTotalFee,
+    confirmTimeoutMs,
   } = validateEnv(args);
   const networkPassphrase = NETWORK_PASSPHRASES[network];
 
@@ -863,15 +1456,60 @@ async function main() {
     log.warn('Running in DRY-RUN mode');
   }
 
+  const manifest = loadManifest(args.manifest);
+  const server = new rpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith('http://') });
+
+  // Read-only record verification: no signing or submission.
+  if (args.verifyRecord) {
+    const { ok } = await verifyDeploymentRecord({ server, recordPath: args.verifyRecord });
+    if (!ok) process.exit(1);
+    return;
+  }
+
+  // Read-only planning mode: never signs or submits.
+  if (args.plan) {
+    validateManifest(manifest, contracts);
+    const existingIds = loadExistingContractIds(network);
+    planDeployment({ network, rpcUrl, contracts, keypair, adminAddress, manifest, existingIds });
+    return;
+  }
+
   const confirmed = await confirmMainnet(network, args.yes);
   if (!confirmed) {
     log.error('Mainnet deployment not confirmed. Aborting.');
     process.exit(1);
   }
 
-  const server = new rpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith('http://') });
+  // Concurrency guard: acquire before any signing/submission.
+  const lockFile = args.dryRun ? null : acquireLock(network, keypair.publicKey());
+
+  await verifyNetworkIdentity({ server, network, networkPassphrase });
 
   await preflightChecks({ server, keypair, network, contracts, dryRun: args.dryRun });
+  try {
+    await runDeployment({ args, server, keypair, network, networkPassphrase, adminAddress, contracts, manifest });
+  } finally {
+    releaseLock(lockFile);
+  }
+}
+
+async function runDeployment({
+  args,
+  server,
+  keypair,
+  network,
+  networkPassphrase,
+  adminAddress,
+  contracts,
+  manifest,
+}) {
+  await preflightChecks({ server, keypair, network, contracts, dryRun: args.dryRun, manifest });
+
+  log.info(`Per-transaction fee ceiling: ${maxFee} stroops`);
+  log.info(`Total fee ceiling: ${maxTotalFee} stroops`);
+  log.info(`Confirmation deadline: ${confirmTimeoutMs}ms`);
+
+  const feeTracker = { spent: 0n };
 
   log.info(`Admin address for init(): ${adminAddress}`);
 
@@ -881,6 +1519,7 @@ async function main() {
     await verifyContract({ server, contractId, contractName, dryRun: false });
   }
   const contractIds = { ...existingIds };
+  const hashes = {};
 
   // TTL observations keyed by contract name, recorded in the deployment record.
   const ttlObservations = {};
@@ -920,6 +1559,7 @@ async function main() {
   }
 
   for (const contract of contractsToDeploy) {
+    const artifactHash = hashWasmFile(contract.wasm);
     const wasmHash = await uploadWasm({
       server,
       keypair,
@@ -927,6 +1567,10 @@ async function main() {
       wasmPath: contract.wasm,
       dryRun: args.dryRun,
       contractName: contract.name,
+      maxFee,
+      maxTotalFee,
+      feeTracker,
+      confirmTimeoutMs,
     });
     wasmHashes[contract.name] = wasmHash;
 
@@ -937,6 +1581,10 @@ async function main() {
       wasmHash,
       dryRun: args.dryRun,
       contractName: contract.name,
+      maxFee,
+      maxTotalFee,
+      feeTracker,
+      confirmTimeoutMs,
     });
 
     await initContract({
@@ -947,6 +1595,10 @@ async function main() {
       adminAddress,
       dryRun: args.dryRun,
       contractName: contract.name,
+      maxFee,
+      maxTotalFee,
+      feeTracker,
+      confirmTimeoutMs,
     });
 
     await verifyContract({
@@ -959,6 +1611,17 @@ async function main() {
 
     await recordTtl(contract.name, contractId, wasmHash);
 
+    let onChainHash = null;
+    if (!args.dryRun) {
+      onChainHash = await fetchOnChainWasmHash(server, contractId);
+      if (onChainHash && onChainHash !== artifactHash) {
+        log.warn(
+          `On-chain executable hash for "${contract.name}" (${onChainHash}) differs from local artifact (${artifactHash})`
+        );
+      }
+    }
+
+    hashes[contract.name] = { artifactHash, onChainHash };
     contractIds[contract.name] = contractId;
   }
 
@@ -970,7 +1633,8 @@ async function main() {
     keypair.publicKey(),
     {},
     args.dryRun,
-    ttlObservations
+    ttlObservations,
+    hashes
   );
 
   log.step('Deployment complete');
@@ -1004,7 +1668,15 @@ module.exports = {
   validateEnv,
   CONTRACTS,
   contractEnvName,
+  verifyNetworkIdentity,
+  loadManifest,
+  hashWasmFile,
+  validateManifest,
+  acquireLock,
+  releaseLock,
+  lockFilePath,
   preflightChecks,
+  enforceFeeCeiling,
   submitTransaction,
   pollTransaction,
   uploadWasm,
@@ -1012,7 +1684,13 @@ module.exports = {
   initContract,
   verifyContract,
   inspectContractTtl,
+  fetchOnChainWasmHash,
   loadExistingContractIds,
   writeContractIds,
   writeDeploymentRecord,
+  DEFAULT_MAX_FEE_STROOPS,
+  DEFAULT_MAX_TOTAL_FEE_STROOPS,
+  DEFAULT_CONFIRM_TIMEOUT_MS,
+  verifyDeploymentRecord,
+  planDeployment,
 };
