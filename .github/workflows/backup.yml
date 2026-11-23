@@ -125,8 +125,12 @@ jobs:
       - name: Run restore verification
         if: steps.config.outputs.ready == 'true'
         env:
-          # The staging role needs CREATEDB: verification restores into a
-          # throwaway database that is dropped afterwards.
+          # The staging role needs CREATEDB (verification restores into a
+          # throwaway database that is dropped afterwards) plus the schema and
+          # table privileges required to load the dump. restore.sh runs a
+          # connectivity/permission preflight before decrypting the archive, so
+          # an unreachable or under-privileged target fails fast without
+          # leaving decrypted staging artifacts behind.
           DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
           BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
           BACKUP_STORAGE_BUCKET: ${{ secrets.BACKUP_STORAGE_BUCKET }}
