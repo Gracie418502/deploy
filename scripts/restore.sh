@@ -12,6 +12,9 @@
 #   --database-url <url>   Target Postgres connection string (default: $DATABASE_URL)
 #   --verify-only          Restore into a throwaway database, check every table
 #                          from the backup came back, then drop it
+#   --plan                 Inspect the backup and report its components, versions
+#                          and intended target without writing to any database
+#                          (no CREATE DATABASE, no restore, no post-restore SQL)
 #   --work-dir <dir>       Working directory for downloads (default: mktemp -d)
 #   --keep-work-dir        Do not delete the working directory on exit
 #   --post-restore-sql <f> Optional SQL script to run against Postgres after
@@ -41,10 +44,18 @@
 #                                    (e.g. to update contract ID rows in DB;
 #                                    for repointing env/ConfigMap contract IDs,
 #                                    use scripts/rollback-contracts.cjs instead)
+#   RESTORE_MAX_MEMBERS              Maximum number of archive members allowed
+#                                    (default: 10000). Archives with more
+#                                    members are rejected before extraction.
+#   RESTORE_MAX_UNCOMPRESSED_BYTES   Maximum total uncompressed size of archive
+#                                    members in bytes (default: 10737418240,
+#                                    i.e. 10 GiB). Oversized archives are
+#                                    rejected before extraction.
 #
 # Exit codes:
 #   0  success
-#   1  usage / configuration error
+#   1  usage / configuration error, or target preflight failure
+#      (unreachable database or missing required privileges)
 #   2  download or checksum failure
 #   3  decryption failure
 #   4  restore failure
@@ -65,7 +76,7 @@ die() {
 }
 
 usage() {
-  sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,51p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # Read a string field from the manifest written by backup.sh. The manifest has
@@ -104,7 +115,6 @@ verify_component_sum() {
   fi
   log "component checksum OK for $component ($actual)"
 }
-=======
 
 # Replace the database name in a postgres:// URL, keeping any query string.
 with_database() {
@@ -113,6 +123,18 @@ with_database() {
     printf '%s/%s%s' "${BASH_REMATCH[1]}" "$db" "${BASH_REMATCH[4]}"
   else
     die 1 "cannot parse database URL for --verify-only (expected postgres://...)"
+  fi
+}
+
+# Report the database name (and host) of a postgres:// URL without connecting.
+database_name_of() {
+  local url="$1"
+  if [[ "$url" =~ ^postgres(ql)?://([^/?]+)(/([^?]*))?(\?.*)?$ ]]; then
+    local host="${BASH_REMATCH[2]}" db="${BASH_REMATCH[4]}"
+    [[ -n "$db" ]] || db="(default)"
+    printf '%s on %s' "$db" "$host"
+  else
+    printf '(unparseable URL)'
   fi
 }
 
@@ -127,6 +149,7 @@ fi
 BACKUP_NAME=""
 DATABASE_URL_ARG=""
 VERIFY_ONLY="false"
+PLAN_ONLY="false"
 ASSUME_YES="false"
 WORK_DIR=""
 KEEP_WORK_DIR="false"
@@ -147,6 +170,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --verify-only)
       VERIFY_ONLY="true"
+      shift
+      ;;
+    --plan)
+      PLAN_ONLY="true"
       shift
       ;;
     -y|--yes)
@@ -181,6 +208,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$PLAN_ONLY" == "true" && "$VERIFY_ONLY" == "true" ]]; then
+  die 1 "--plan and --verify-only are mutually exclusive"
+fi
+
 # Accept either a bare name or a full object name with a known suffix.
 BACKUP_NAME="${BACKUP_NAME%.manifest.json}"
 BACKUP_NAME="${BACKUP_NAME%.tar.gz.enc}"
@@ -205,7 +236,11 @@ CONTRACT_STATE_FILE="${CONTRACT_STATE_FILE:-}"
 TARGET_DATABASE_URL="${DATABASE_URL_ARG:-${DATABASE_URL:-}}"
 
 [[ -n "$BUCKET" ]] || die 1 "BACKUP_STORAGE_BUCKET is not set"
-[[ -n "$TARGET_DATABASE_URL" ]] || die 1 "target database URL is not set (use --database-url or DATABASE_URL)"
+# In plan mode the target is only reported, never connected to, so a missing
+# target URL is not fatal there.
+if [[ "$PLAN_ONLY" != "true" ]]; then
+  [[ -n "$TARGET_DATABASE_URL" ]] || die 1 "target database URL is not set (use --database-url or DATABASE_URL)"
+fi
 
 for tool in psql gzip tar sha256sum python3; do
   command -v "$tool" >/dev/null 2>&1 || die 1 "required tool not found: $tool"
@@ -226,6 +261,68 @@ case "$STORAGE_PROVIDER" in
 esac
 
 # ---------------------------------------------------------------------------
+# Target preflight
+# ---------------------------------------------------------------------------
+# Fail fast, before any download or decryption, when the target database is
+# unreachable or the role lacks the privileges the restore needs. This keeps
+# expensive work (and decrypted staging artifacts) from being produced for a
+# target that cannot accept the restore.
+preflight_target() {
+  local url="$1" verify_only="$2"
+
+  log "preflight: checking connectivity to target database"
+  if ! PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}" \
+       psql "$url" -v ON_ERROR_STOP=1 -X -At -q -c 'SELECT 1' >/dev/null 2>&1; then
+    die 1 "preflight failed: cannot connect to target database (check --database-url / DATABASE_URL, network access and credentials)"
+  fi
+
+  # The dump replays DROP/CREATE statements, so the role needs CREATE on the
+  # target database and on the public schema, plus TRUNCATE/INSERT on any
+  # existing tables it will overwrite.
+  local missing
+  missing="$(psql "$url" -v ON_ERROR_STOP=1 -X -At -q -c "
+    SELECT missing FROM (
+      SELECT 'CREATE on database' AS missing
+       WHERE NOT has_database_privilege(current_user, current_database(), 'CREATE')
+      UNION ALL
+      SELECT 'CREATE on schema public'
+       WHERE NOT has_schema_privilege(current_user, 'public', 'CREATE')
+      UNION ALL
+      SELECT 'TRUNCATE on ' || schemaname || '.' || tablename
+        FROM pg_tables
+       WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+         AND NOT has_table_privilege(current_user, quote_ident(schemaname) || '.' || quote_ident(tablename), 'TRUNCATE')
+      UNION ALL
+      SELECT 'INSERT on ' || schemaname || '.' || tablename
+        FROM pg_tables
+       WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+         AND NOT has_table_privilege(current_user, quote_ident(schemaname) || '.' || quote_ident(tablename), 'INSERT')
+    ) AS checks;
+  " 2>/dev/null)" || die 1 "preflight failed: could not evaluate target database privileges"
+
+  if [[ -n "$missing" ]]; then
+    log "preflight: missing required privileges:"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && log "  - $line"
+    done <<< "$missing"
+    die 1 "preflight failed: target role lacks required privileges (see above)"
+  fi
+
+  if [[ "$verify_only" == "true" ]]; then
+    log "preflight: checking CREATEDB for --verify-only"
+    local can_create
+    can_create="$(psql "$url" -v ON_ERROR_STOP=1 -X -At -q -c \
+      "SELECT rolcreatedb OR rolsuper FROM pg_roles WHERE rolname = current_user;" 2>/dev/null)" \
+      || die 1 "preflight failed: could not evaluate CREATEDB privilege"
+    if [[ "$can_create" != "t" ]]; then
+      die 1 "preflight failed: --verify-only requires the target role to have CREATEDB"
+    fi
+  fi
+
+  log "preflight: target database OK"
+}
+
+# ---------------------------------------------------------------------------
 # Working directory
 # ---------------------------------------------------------------------------
 if [[ -z "$WORK_DIR" ]]; then
@@ -237,6 +334,8 @@ else
 fi
 
 VERIFY_DB=""
+ARCHIVE_PATH=""
+EXTRACT_DIR=""
 
 # shellcheck disable=SC2317,SC2329  # invoked via the EXIT trap below
 cleanup() {
@@ -245,8 +344,16 @@ cleanup() {
     psql "$TARGET_DATABASE_URL" -X -q -c "DROP DATABASE IF EXISTS \"$VERIFY_DB\";" >/dev/null 2>&1 || \
       log "WARNING: could not drop verification database $VERIFY_DB"
   fi
-  if [[ "$KEEP_WORK_DIR" != "true" && "$CREATED_WORK_DIR" == "true" ]]; then
-    rm -rf "$WORK_DIR"
+  if [[ "$KEEP_WORK_DIR" != "true" ]]; then
+    # Remove decrypted staging artifacts on any failure, even when the caller
+    # supplied --work-dir, so plaintext dumps never linger after a failed run.
+    if [[ "$status" -ne 0 ]]; then
+      [[ -n "$ARCHIVE_PATH" && -f "$ARCHIVE_PATH" ]] && rm -f "$ARCHIVE_PATH"
+      [[ -n "$EXTRACT_DIR" && -d "$EXTRACT_DIR" ]] && rm -rf "$EXTRACT_DIR"
+    fi
+    if [[ "$CREATED_WORK_DIR" == "true" ]]; then
+      rm -rf "$WORK_DIR"
+    fi
   fi
   exit "$status"
 }
@@ -309,6 +416,11 @@ latest_backup_name() {
       ;;
   esac
 }
+
+# ---------------------------------------------------------------------------
+# Preflight the target before any download or decryption work
+# ---------------------------------------------------------------------------
+preflight_target "$TARGET_DATABASE_URL" "$VERIFY_ONLY"
 
 # ---------------------------------------------------------------------------
 # Download, verify, decrypt, extract
@@ -376,6 +488,9 @@ case "$ENCRYPTION_METHOD" in
     ;;
 esac
 
+# Validate the decrypted archive before extraction: reject unsafe paths/types,
+# duplicate normalized member names, and archives exceeding the configured
+# member-count / uncompressed-size budgets.
 python3 "$(dirname "${BASH_SOURCE[0]}")/validate-archive.py" "$ARCHIVE_PATH" \
   || die 3 "archive contains unsafe paths or file types"
 
@@ -386,6 +501,9 @@ log "validating archive contents against the restore component allowlist"
 python3 "$(dirname "${BASH_SOURCE[0]}")/validate-archive.py" --allowlist "$ARCHIVE_PATH" \
   || die 3 "archive contents failed allowlist validation (unexpected or missing components)"
 
+  --max-members "${RESTORE_MAX_MEMBERS:-10000}" \
+  --max-uncompressed-bytes "${RESTORE_MAX_UNCOMPRESSED_BYTES:-10737418240}" \
+  || die 3 "archive rejected: unsafe paths or file types, duplicate member paths, or exceeds size/member budget"
 EXTRACT_DIR="$(mktemp -d "$WORK_DIR/extracted.XXXXXXXX")"
 tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR" || die 3 "archive is not a valid tar.gz"
 
@@ -409,6 +527,80 @@ if [[ -d "$EXTRACT_DIR/contracts" ]]; then
   else
     log "WARNING: manifest has no checksum for contracts; skipping component verification"
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# Plan mode
+# ---------------------------------------------------------------------------
+# Report what a restore would do without writing to any database. Everything
+# below is read-only: no CREATE DATABASE, no psql restore, no post-restore SQL.
+print_plan() {
+  local schema_version created_at pg_version source_db
+  schema_version="$(manifest_field schema_version "$MANIFEST_PATH")"
+  created_at="$(manifest_field created_at "$MANIFEST_PATH")"
+  pg_version="$(manifest_field pg_version "$MANIFEST_PATH")"
+  source_db="$(manifest_field database "$MANIFEST_PATH")"
+
+  printf 'Restore plan\n' >&2
+  printf '============\n' >&2
+  printf 'Backup name:        %s\n' "$BACKUP_NAME" >&2
+  printf 'Storage:            %s://%s/%s\n' "$STORAGE_PROVIDER" "$BUCKET" "$PREFIX" >&2
+  printf 'Archive key:        %s\n' "$ARCHIVE_KEY" >&2
+  printf 'Manifest schema:    %s\n' "${schema_version:-unknown}" >&2
+  printf 'Created at:         %s\n' "${created_at:-unknown}" >&2
+  printf 'Postgres version:   %s\n' "${pg_version:-unknown}" >&2
+  printf 'Source database:    %s\n' "${source_db:-unknown}" >&2
+  printf 'Encryption method:  %s\n' "${ENCRYPTION_METHOD:-unknown}" >&2
+  printf 'Archive checksum:   %s (verified)\n' "$ACTUAL_SUM" >&2
+
+  printf '\nComponents:\n' >&2
+  local dump_sum contracts_sum
+  dump_sum="$(manifest_component_sum "database.sql.gz" "$MANIFEST_PATH")"
+  printf '  database.sql.gz   %s\n' "${dump_sum:+sha256:$dump_sum (verified)}${dump_sum:-no checksum recorded}" >&2
+  if [[ -d "$EXTRACT_DIR/contracts" ]]; then
+    contracts_sum="$(manifest_component_sum "contracts" "$MANIFEST_PATH")"
+    printf '  contracts/        %s\n' "${contracts_sum:+sha256:$contracts_sum (verified)}${contracts_sum:-no checksum recorded}" >&2
+  else
+    printf '  contracts/        not present in archive\n' >&2
+  fi
+  if [[ -f "$EXTRACT_DIR/tables.txt" ]]; then
+    local table_count
+    table_count="$(grep -c . "$EXTRACT_DIR/tables.txt" || true)"
+    printf '  tables.txt        %s table(s) recorded\n' "$table_count" >&2
+  else
+    printf '  tables.txt        not present in archive\n' >&2
+  fi
+
+  printf '\nIntended target:\n' >&2
+  if [[ -n "$TARGET_DATABASE_URL" ]]; then
+    printf '  %s\n' "$(database_name_of "$TARGET_DATABASE_URL")" >&2
+  else
+    printf '  (no target configured; pass --database-url or set DATABASE_URL)\n' >&2
+  fi
+
+  printf '\nPlanned actions:\n' >&2
+  if [[ "$VERIFY_ONLY" == "true" ]]; then
+    printf '  - create a throwaway verification database and restore into it\n' >&2
+    printf '  - compare restored tables against the backup table list\n' >&2
+    printf '  - drop the throwaway database\n' >&2
+  else
+    printf '  - restore over the target database (DROP ... IF EXISTS)\n' >&2
+    local sql_file="${POST_RESTORE_SQL_ARG:-${CONTRACT_STATE_FILE:-}}"
+    if [[ "$SKIP_CONTRACT_STATE" == "true" ]]; then
+      printf '  - skip post-restore SQL (--skip-contract-state)\n' >&2
+    elif [[ -n "$sql_file" ]]; then
+      printf '  - apply post-restore SQL from %s\n' "$sql_file" >&2
+    else
+      printf '  - no post-restore SQL configured\n' >&2
+    fi
+  fi
+
+  printf '\nPlan only: no database writes were performed.\n' >&2
+}
+
+if [[ "$PLAN_ONLY" == "true" ]]; then
+  print_plan
+  exit 0
 fi
 
 # ---------------------------------------------------------------------------

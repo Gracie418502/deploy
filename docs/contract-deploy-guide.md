@@ -20,11 +20,19 @@ This guide walks through deploying the Soroban contracts and wiring up the backe
 cp contract-ids.env "contract-ids.env.$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
 
 # 3. Deploy all contracts (uploads WASM, deploys, calls init(admin), verifies,
-#    writes contract-ids.env). Add --dry-run to run only the pre-flight checks.
+#    writes contract-ids.env). Add --dry-run to run only the pre-flight checks,
+#    or --plan for a read-only report that never signs or submits anything.
 STELLAR_SECRET_KEY=S... \
 ADMIN_PUBLIC_KEY=G...   `# optional; defaults to the deployer` \
 CONTRACTS_WASM_DIR=../contracts/target/wasm32-unknown-unknown/release \
 npm run deploy:contracts -- --network testnet
+
+# Preview what would happen without touching the network (no signing, no
+# submission, secrets masked in the output):
+npm run deploy:contracts -- --network testnet --plan
+
+# Deploy with checksum validation against a build manifest:
+npm run deploy:contracts -- --network testnet --manifest build-manifest.json
 
 # Roll back: point the backend at a previous set of contract IDs
 npm run rollback:contracts -- --backup contract-ids.env.<timestamp> \
@@ -35,6 +43,55 @@ The deploy script performs pre-flight checks (valid key, funded account, WASM
 present), deploys `vault-registry`, `access-lease` and `subscription`,
 initialises each with `init(admin)`, and writes the resulting contract IDs to
 `contract-ids.env`. Mainnet requires typing a confirmation, or `--yes` in CI.
+
+### Build manifest and checksum validation
+
+Pass `--manifest <path>` to validate every WASM artifact against expected
+SHA-256 checksums **before any deployment transaction is signed**. The manifest
+is a JSON object mapping artifact file names to their expected lowercase hex
+SHA-256 digest:
+
+```json
+{
+  "vault_registry.wasm": "3f2a...e91c",
+  "access_lease.wasm": "9b04...77d2",
+  "subscription.wasm": "c1d8...0a5f"
+}
+```
+
+Generate the digests from a trusted build (e.g. `sha256sum *.wasm` in the
+release directory) and commit the manifest alongside the audited commit SHA.
+If an artifact is missing from the manifest, or its digest does not match, the
+deploy aborts with a clear error before anything is signed or submitted.
+
+### Deployment record and post-deployment hash verification
+
+After a successful deploy the script writes a deployment record (JSON) that
+includes, for each contract, the `artifactHash` (SHA-256 of the local WASM that
+was uploaded) and the `onChainHash` (the executable hash reported by the
+network for the deployed contract). To verify a deployment later, re-run the
+script with the verification flag (or the dedicated verification workflow) and
+it will re-read the on-chain executable hashes and compare them against the
+recorded values. A mismatch means the deployed contract no longer corresponds
+to the artifact you recorded — investigate before pointing the backend at it.
+Keep the deployment record with the release notes for audit purposes.
+
+### Concurrency guard
+
+The script takes a lockfile keyed by network and signer public key so two
+deployments using the same Stellar account cannot run at the same time and
+silently race account sequence numbers. If a lock is already held, the second
+run exits with an error naming the lock file. Stale locks (e.g. from a crashed
+run) are detected and reported; remove the lock file only after confirming no
+deployment is still in flight. Do not run concurrent deployments with the same
+signer — use a separate funded account per concurrent deployment.
+
+### Read-only plan mode
+
+`--plan` prints the selected network, artifact hashes, signer public key and
+the planned contract operations (upload/deploy/init) without signing or
+submitting any transaction. Secret material (secret keys, seeds) is masked in
+the output, so plan mode is safe to run in shared logs and CI.
 
 Soroban contracts are immutable, so rollback never removes anything on-chain:
 it verifies that each contract in the backup file still exists on-chain, then
@@ -92,8 +149,15 @@ While the quickstart steps below focus on **Testnet**, deploying to **Stellar Ma
 - **Balance check** — confirms the deployer account holds enough XLM to cover
   upload and deployment fees.
 - **WASM hash check** — builds the contracts and compares the resulting WASM hashes
-  against the recorded hashes to detect unintended changes.
+  against the recorded hashes to detect unintended changes. Pass
+  `--manifest build-manifest.json` to enforce the audited SHA-256 checksums; a
+  modified artifact aborts before any transaction is signed.
 - **Contract ID check** — warns if any target contract ID already exists on-chain.
+- **Concurrency guard** — refuses to run if another deployment with the same
+  signer and network holds the lock, preventing sequence-number races.
+- **Plan mode** — run `--plan` first to review the network, artifact hashes,
+  signer public key and planned operations without signing or submitting
+  anything (secrets are masked).
 - **Confirmation prompt** — prints a summary of the network, deployer, contract IDs
   and WASM hashes, then requires you to type `deploy mainnet` (or pass `--yes` in CI) to proceed.
 
