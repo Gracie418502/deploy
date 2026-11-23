@@ -119,6 +119,90 @@ jobs:
           # the actual placeholder check is enforced in deploy workflows where
           # real secrets are available via GitHub Actions secrets.
           node scripts/check-env.js --help > /dev/null
+      - name: Verify check-env validation rules
+        run: |
+          set -euo pipefail
+          work_dir="$(mktemp -d)"
+          trap 'rm -rf "${work_dir}"' EXIT
+
+          # Generate a valid Stellar keypair for the positive cases.
+          keypair="$(node scripts/01-generate-keypairs.js)"
+          public_key="$(printf '%s\n' "${keypair}" | sed -n 's/^Public [Kk]ey: *//p' | head -n1)"
+          secret_key="$(printf '%s\n' "${keypair}" | sed -n 's/^Secret [Kk]ey: *//p' | head -n1)"
+          if [ -z "${public_key}" ] || [ -z "${secret_key}" ]; then
+            echo "::error::Could not parse generated keypair"
+            exit 1
+          fi
+
+          # A valid contract ID (StrKey C...) for checksum validation.
+          contract_id="CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+
+          base_env() {
+            cat <<EOF
+          STELLAR_NETWORK=testnet
+          STELLAR_PUBLIC_KEY=${public_key}
+          STELLAR_SECRET_KEY=${secret_key}
+          STELLAR_CONTRACT_ID=${contract_id}
+          EOF
+          }
+
+          expect_pass() {
+            local name="$1" file="$2"
+            if ! node scripts/check-env.js --target compose --env-file "${file}" > "${work_dir}/out.log" 2>&1; then
+              echo "::error::check-env rejected valid case: ${name}"
+              cat "${work_dir}/out.log"
+              exit 1
+            fi
+          }
+
+          expect_fail() {
+            local name="$1" file="$2" pattern="$3"
+            if node scripts/check-env.js --target compose --env-file "${file}" > "${work_dir}/out.log" 2>&1; then
+              echo "::error::check-env accepted invalid case: ${name}"
+              cat "${work_dir}/out.log"
+              exit 1
+            fi
+            if ! grep -Eq "${pattern}" "${work_dir}/out.log"; then
+              echo "::error::check-env error for ${name} did not match ${pattern}"
+              cat "${work_dir}/out.log"
+              exit 1
+            fi
+            # Secrets must never be echoed in diagnostics.
+            if grep -qF "${secret_key}" "${work_dir}/out.log"; then
+              echo "::error::check-env leaked the secret key for ${name}"
+              exit 1
+            fi
+          }
+
+          # Positive: documented networks are accepted.
+          for network in testnet mainnet futurenet; do
+            base_env | sed "s/^STELLAR_NETWORK=.*/STELLAR_NETWORK=${network}/" > "${work_dir}/valid-${network}.env"
+            expect_pass "network ${network}" "${work_dir}/valid-${network}.env"
+          done
+
+          # Negative: unsupported network values are rejected.
+          base_env | sed 's/^STELLAR_NETWORK=.*/STELLAR_NETWORK=devnet/' > "${work_dir}/bad-network.env"
+          expect_fail "unsupported network" "${work_dir}/bad-network.env" 'STELLAR_NETWORK'
+
+          # Negative: checksum-invalid account, secret and contract IDs.
+          base_env | sed "s/^STELLAR_PUBLIC_KEY=.*/STELLAR_PUBLIC_KEY=GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF/" > "${work_dir}/bad-public.env"
+          expect_fail "bad public key checksum" "${work_dir}/bad-public.env" 'STELLAR_PUBLIC_KEY'
+          base_env | sed "s/^STELLAR_SECRET_KEY=.*/STELLAR_SECRET_KEY=SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF/" > "${work_dir}/bad-secret.env"
+          expect_fail "bad secret key checksum" "${work_dir}/bad-secret.env" 'STELLAR_SECRET_KEY'
+          base_env | sed "s/^STELLAR_CONTRACT_ID=.*/STELLAR_CONTRACT_ID=CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF/" > "${work_dir}/bad-contract.env"
+          expect_fail "bad contract checksum" "${work_dir}/bad-contract.env" 'STELLAR_CONTRACT_ID'
+
+          # Negative: public key does not match the secret key.
+          other_keypair="$(node scripts/01-generate-keypairs.js)"
+          other_public="$(printf '%s\n' "${other_keypair}" | sed -n 's/^Public [Kk]ey: *//p' | head -n1)"
+          base_env | sed "s/^STELLAR_PUBLIC_KEY=.*/STELLAR_PUBLIC_KEY=${other_public}/" > "${work_dir}/mismatch.env"
+          expect_fail "keypair mismatch" "${work_dir}/mismatch.env" 'STELLAR_(PUBLIC|SECRET)_KEY'
+
+          # Negative: whitespace-only required values are treated as missing.
+          base_env | sed 's/^STELLAR_NETWORK=.*/STELLAR_NETWORK="   "/' > "${work_dir}/blank-network.env"
+          expect_fail "whitespace-only network" "${work_dir}/blank-network.env" 'STELLAR_NETWORK'
+          base_env | sed 's/^STELLAR_PUBLIC_KEY=.*/STELLAR_PUBLIC_KEY="  "/' > "${work_dir}/blank-public.env"
+          expect_fail "whitespace-only public key" "${work_dir}/blank-public.env" 'STELLAR_PUBLIC_KEY'
       - name: Lint Node scripts
         run: npm run lint
       - name: Unit tests
