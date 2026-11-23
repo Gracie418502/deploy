@@ -34,6 +34,18 @@ The following data is backed up:
 
 Both run from [`.github/workflows/backup.yml`](../.github/workflows/backup.yml) and can also be started manually (**Run workflow** → `backup`, `verify-restore` or `both`). Until the required secrets are configured, the jobs are skipped with a warning instead of failing.
 
+### Backup outcomes: upload vs. retention
+
+`backup.sh` reports two independent outcomes so operators can tell whether a recoverable backup exists:
+
+| Field | Meaning | Where it appears |
+| --- | --- | --- |
+| `upload_status` | `success` once the encrypted archive **and** its manifest are in object storage; `failed` otherwise | Final summary line, `backup-status.json` workflow artifact, `$GITHUB_STEP_SUMMARY` |
+| `retention_status` | `success` when the configured retention/pruning step completed; `failed` when pruning errored | Same places as `upload_status` |
+
+**A recoverable backup exists whenever `upload_status=success`, even if `retention_status=failed`.** A pruning failure means old backups may accumulate (and bucket lifecycle rules still apply); it does **not** mean the new backup is missing. The script exits non-zero when either status is `failed`, but the summary and status file always distinguish the two so a retention failure is never mistaken for a lost backup — or vice versa. When `retention_status=failed`, check bucket usage and re-run pruning (or rely on the bucket lifecycle policy in section 3); no re-upload is needed.
+=======
+
 ### Required configuration
 
 Repository secrets:
@@ -151,6 +163,33 @@ The manifest records both the PostgreSQL **server** version and the **`pg_dump` 
 - Uploads use TLS. Enable server-side encryption on the bucket as an additional layer.
 - Access to the backup bucket should be restricted to the backup credentials and on-call engineers via least-privilege policies.
 
+### 4.1 Multiple age recipients (multiple custodians)
+
+To let more than one authorized custodian recover a backup, encrypt to a **recipients file** instead of a single recipient:
+
+1. Each custodian generates their own age key pair locally and shares **only** the public recipient (`age1...`) with the backup operator. Private identities never leave the custodian's machine or secrets manager.
+2. The operator maintains a recipients file (one `age1...` recipient per line, comments allowed), stored in the secrets manager and injected at runtime, e.g.:
+   ```bash
+   export BACKUP_ENCRYPTION_METHOD=age
+   export BACKUP_AGE_RECIPIENTS_FILE=/run/secrets/backup-age-recipients.txt
+   ./scripts/backup.sh
+   ```
+   `BACKUP_ENCRYPTION_KEY` may also point at a recipients file path. The file is read at encryption time and is **not** copied into the archive or manifest — artifacts contain no identities, only the ciphertext.
+3. Any single listed recipient can decrypt the same archive:
+   ```bash
+   BACKUP_AGE_IDENTITY_FILE=~/custodian-a.key ./scripts/restore.sh --plan --backup soroban-backup-<timestamp>
+   ```
+4. **Verify each identity independently** (do this when adding or rotating a custodian, and in the quarterly drill): for each custodian, decrypt the same archive with that custodian's identity and confirm the component checksums match the manifest:
+   ```bash
+   for id in ~/custodian-a.key ~/custodian-b.key; do
+     BACKUP_AGE_IDENTITY_FILE="$id" ./scripts/restore.sh --verify-only \
+       --backup soroban-backup-<timestamp> --database-url "$STAGING_DATABASE_URL"
+   done
+   ```
+   Each run must reach `restore complete`; a failure means that custodian cannot recover and their recipient must be re-added and a new backup taken.
+5. Removing a custodian only affects **future** backups: drop their recipient from the file and take a new backup. Existing archives remain decryptable by them until they age out of retention.
+=======
+
 ## 5. Storage Locations
 
 | Environment | Bucket | Region |
@@ -202,28 +241,35 @@ When hosting PostgreSQL on Supabase in production, enable **Supabase Point-in-Ti
    ```
    Pick the newest backup that precedes the incident. If you omit `--backup`, `restore.sh` uses the newest one.
 
-2. **Rehearse against a scratch database (recommended).**
+2. **Plan the restore (no database writes).**
+   ```bash
+   ./scripts/restore.sh --plan --backup soroban-backup-<timestamp> \
+     --database-url "$DATABASE_URL"
+   ```
+   `--plan` downloads the manifest and archive, validates the manifest schema and required fields, verifies the archive SHA-256 and component checksums, and reports the archive's components, the recorded `postgres` versions (`serverVersion`, `pgDumpVersion`), the target server version and the intended target database — then stops. It runs no mutating SQL and does not create, drop or modify anything in the target. Use it to confirm compatibility (section 0) and that the right backup and target were chosen before any restore. It exits non-zero if validation fails.
+
+3. **Rehearse against a scratch database (recommended).**
    ```bash
    ./scripts/restore.sh --backup soroban-backup-<timestamp> --verify-only \
      --database-url postgresql://<user>:<pass>@<staging-host>:5432/postgres
    ```
 
-3. **Restore into the target database.**
+4. **Restore into the target database.**
    ```bash
    ./scripts/restore.sh --backup soroban-backup-<timestamp> --database-url "$DATABASE_URL"
    ```
    The script downloads the manifest and archive, validates the manifest schema version and required fields, verifies the archive SHA-256, decrypts, then validates the decrypted tarball before extraction: member count and total uncompressed size must stay within the configured budgets, and no two members may normalize to the same path (see section 2). Only after these checks pass does it extract, verify each component checksum from `components` against the decrypted files, and replay the dump in a single transaction (a failed restore changes nothing). Objects in the target that are not in the backup are left in place. If the manifest's `postgres` versions are incompatible with the target server, the script warns (or aborts with `--verify-only`) before applying anything.
 
-4. **Inspect contract state snapshots (if needed).** Add `--keep-work-dir` to keep the extracted `contracts/` snapshots. On-chain state cannot be "restored"; use the snapshots to confirm which contract IDs the application should point at, and use `scripts/rollback-contracts.cjs` to repoint it.
+5. **Inspect contract state snapshots (if needed).** Add `--keep-work-dir` to keep the extracted `contracts/` snapshots. On-chain state cannot be "restored"; use the snapshots to confirm which contract IDs the application should point at, and use `scripts/rollback-contracts.cjs` to repoint it.
 
-5. **Re-provision secrets.** Retrieve the required secrets from the secrets manager and inject them into the restored environment. Do **not** restore secrets from backups.
+6. **Re-provision secrets.** Retrieve the required secrets from the secrets manager and inject them into the restored environment. Do **not** restore secrets from backups.
 
-6. **Run migrations (if the backup predates the current release).** The Kubernetes `migrate` initContainer does this on the next rollout, or run it manually:
+7. **Run migrations (if the backup predates the current release).** The Kubernetes `migrate` initContainer does this on the next rollout, or run it manually:
    ```bash
    kubectl -n synapsvault rollout restart deployment/backend
    ```
 
-7. **Restart application services** against the restored database.
+8. **Restart application services** against the restored database.
 
 ### 7.3 Verification
 
@@ -243,6 +289,9 @@ If the restore fails, `restore.sh` rolls its transaction back and exits non-zero
 ## 8. Testing
 
 - Restores are verified automatically **weekly** against staging by the `verify-restore` job.
+- `backup.sh --dry-run` prints the planned components (database dump, contract snapshots), the destination bucket/prefix and the retention actions that would run, then exits. It performs **no** dump, upload or delete, and never prints credentials, keys or connection strings (they are redacted). Use it to validate configuration changes safely.
+- `restore.sh --plan` is exercised in the verification workflow to confirm a backup's metadata and archive safety without touching a database.
+- The verification workflow also covers a successful upload followed by a failed retention cleanup, asserting `upload_status=success` and `retention_status=failed` are reported separately.
 - Full restore drills are performed **quarterly** in the staging environment.
 - Drill results (time to restore, issues encountered) are recorded in the incident log.
 - Any gaps identified during drills must be addressed before the next drill.

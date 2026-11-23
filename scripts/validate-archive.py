@@ -34,6 +34,26 @@ REQUIRED_STRING_FIELDS = (
 
 REQUIRED_COMPONENTS = ('database', 'contracts')
 
+# Archive members a restore plan reports on. These are informational: plan mode
+# lists which are present without requiring any particular one.
+KNOWN_ARCHIVE_COMPONENTS = ('database.sql.gz', 'tables.txt', 'contracts/')
+
+# Optional, backward-compatible status fields. Older manifests omit them; when
+# present they must be non-empty strings so plan mode can report them.
+OPTIONAL_STATUS_FIELDS = ('upload_status', 'retention_status')
+
+
+def _member_path(member):
+    return PurePosixPath(member.name)
+
+
+def _check_member(member):
+    path = _member_path(member)
+    if path.is_absolute() or '..' in path.parts:
+        raise ValueError(f'unsafe archive path: {member.name}')
+    if not (member.isfile() or member.isdir()):
+        raise ValueError(f'unsupported archive member: {member.name}')
+
 
 def normalize_member_name(name):
     """Return a canonical member path for duplicate detection.
@@ -81,11 +101,25 @@ def validate(archive, max_members=None, max_uncompressed_bytes=None):
     total_size = 0
     with tarfile.open(archive, 'r:gz') as bundle:
         for member in bundle:
-            path = PurePosixPath(member.name)
-            if path.is_absolute() or '..' in path.parts:
-                raise ValueError(f'unsafe archive path: {member.name}')
-            if not (member.isfile() or member.isdir()):
-                raise ValueError(f'unsupported archive member: {member.name}')
+            _check_member(member)
+
+
+def inspect_archive(archive):
+    """Validate archive safety and report its known components.
+
+    Returns a dict mapping each known component name to a boolean indicating
+    whether it is present. No database writes or extraction occur.
+    """
+    present = {name: False for name in KNOWN_ARCHIVE_COMPONENTS}
+    with tarfile.open(archive, 'r:gz') as bundle:
+        for member in bundle:
+            _check_member(member)
+            name = member.name
+            if name in present:
+                present[name] = True
+            elif name.startswith('contracts/'):
+                present['contracts/'] = True
+    return present
 
             normalized = normalize_member_name(member.name)
             if normalized in seen:
@@ -141,6 +175,10 @@ def validate_manifest(manifest):
 
     for field in REQUIRED_STRING_FIELDS:
         _require_string(manifest, field)
+
+    for field in OPTIONAL_STATUS_FIELDS:
+        if field in manifest:
+            _require_string(manifest, field)
 
     size = _require(manifest, 'sizeBytes')
     if isinstance(size, bool) or not isinstance(size, int) or size < 0:

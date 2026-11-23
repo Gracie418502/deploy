@@ -154,6 +154,117 @@ EOF
   [ "$status" -eq 0 ]
 }
 
+@test "restore.sh --plan reports components, versions and target without mutating the database" {
+  local workdir="$BATS_TEST_TMPDIR/plan-work"
+  mkdir -p "$workdir/archive"
+  printf 'valid database dump\n' >"$workdir/archive/database.sql"
+  printf 'contracts\n' >"$workdir/archive/contracts.tar.gz"
+  local db_sum contracts_sum
+  db_sum="$(sha256sum "$workdir/archive/database.sql" | awk '{print $1}')"
+  contracts_sum="$(sha256sum "$workdir/archive/contracts.tar.gz" | awk '{print $1}')"
+
+  local manifest="$BATS_TEST_TMPDIR/plan.manifest.json"
+  cat >"$manifest" <<EOF
+{
+  "schemaVersion": 1,
+  "key": "backups/soroban-backup-20260101T020000Z.tar.gz.enc",
+  "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "method": "gpg",
+  "postgresServerVersion": "16.2",
+  "pgDumpVersion": "16.2",
+  "componentChecksums": {
+    "database.sql": "$db_sum",
+    "contracts.tar.gz": "$contracts_sum"
+  }
+}
+EOF
+
+  # Any psql invocation is a failure: --plan must never touch the database.
+  local stub_dir="$BATS_TEST_TMPDIR/plan-bin"
+  mkdir -p "$stub_dir"
+  cat >"$stub_dir/psql" <<'EOF'
+#!/usr/bin/env bash
+echo "psql must not be invoked in plan mode" >&2
+exit 99
+EOF
+  chmod +x "$stub_dir/psql"
+
+  run env PATH="$stub_dir:$PATH" \
+    DATABASE_URL="postgres://user:pass@localhost:5432/soroban" \
+    RESTORE_PLAN_ARCHIVE_DIR="$workdir/archive" \
+    "$REPO_ROOT/scripts/restore.sh" --manifest "$manifest" --plan
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"database.sql"* ]]
+  [[ "$output" == *"contracts.tar.gz"* ]]
+  [[ "$output" == *"16.2"* ]]
+  [[ "$output" == *"soroban"* ]]
+  [[ "$output" != *"psql must not be invoked"* ]]
+}
+
+@test "restore.sh --plan rejects an unsupported manifest schema version" {
+  local manifest="$BATS_TEST_TMPDIR/plan-unsupported.manifest.json"
+  cat >"$manifest" <<'EOF'
+{
+  "schemaVersion": 999,
+  "key": "backups/soroban-backup-20260101T020000Z.tar.gz.enc",
+  "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "method": "gpg",
+  "postgresServerVersion": "16.2",
+  "pgDumpVersion": "16.2",
+  "componentChecksums": {
+    "database.sql": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  }
+}
+EOF
+  run "$REPO_ROOT/scripts/restore.sh" --manifest "$manifest" --plan
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"schema"* || "$output" == *"version"* ]]
+}
+
+@test "restore.sh --plan fails when a component checksum does not match" {
+  local workdir="$BATS_TEST_TMPDIR/plan-mismatch"
+  mkdir -p "$workdir/archive"
+  printf 'tampered database dump\n' >"$workdir/archive/database.sql"
+
+  local manifest="$BATS_TEST_TMPDIR/plan-mismatch.manifest.json"
+  cat >"$manifest" <<'EOF'
+{
+  "schemaVersion": 1,
+  "key": "backups/soroban-backup-20260101T020000Z.tar.gz.enc",
+  "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "method": "gpg",
+  "postgresServerVersion": "16.2",
+  "pgDumpVersion": "16.2",
+  "componentChecksums": {
+    "database.sql": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}
+EOF
+  run env RESTORE_PLAN_ARCHIVE_DIR="$workdir/archive" \
+    "$REPO_ROOT/scripts/restore.sh" --manifest "$manifest" --plan
+  [ "$status" -ne 0 ]
+}
+
+@test "restore.sh --plan rejects an unsafe archive entry" {
+  local workdir="$BATS_TEST_TMPDIR/plan-unsafe"
+  mkdir -p "$workdir/archive"
+  printf 'malicious\n' >"$workdir/archive/../escape.txt"
+
+  local manifest="$BATS_TEST_TMPDIR/plan-unsafe.manifest.json"
+  cat >"$manifest" <<'EOF'
+{
+  "schemaVersion": 1,
+  "key": "backups/soroban-backup-20260101T020000Z.tar.gz.enc",
+  "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "method": "gpg",
+  "postgresServerVersion": "16.2",
+  "pgDumpVersion": "16.2",
+  "componentChecksums": {}
+}
+EOF
+  run env RESTORE_PLAN_ARCHIVE_DIR="$workdir/archive" \
+    "$REPO_ROOT/scripts/restore.sh" --manifest "$manifest" --plan
+  [ "$status" -ne 0 ]
 @test "validate_archive rejects an archive with too many members" {
   local archive="$BATS_TEST_TMPDIR/many-members.tar.gz"
   local workdir="$BATS_TEST_TMPDIR/many-members-src"
