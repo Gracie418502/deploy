@@ -163,3 +163,60 @@ EOF
   run "$REPO_ROOT/scripts/restore.sh" --not-a-flag
   [ "$status" -eq 1 ]
 }
+
+@test "backup.sh accepts a valid artifact name and storage prefix" {
+  run validate_artifact_name "soroban-backup-20260101T020000Z.tar.gz.enc"
+  [ "$status" -eq 0 ]
+
+  run validate_storage_prefix "backups/soroban"
+  [ "$status" -eq 0 ]
+}
+
+@test "backup.sh rejects artifact names containing slashes" {
+  run validate_artifact_name "backups/soroban-backup.tar.gz.enc"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"artifact"* ]]
+}
+
+@test "backup.sh rejects artifact names with parent traversal segments" {
+  run validate_artifact_name ".."
+  [ "$status" -ne 0 ]
+
+  run validate_artifact_name "../soroban-backup.tar.gz.enc"
+  [ "$status" -ne 0 ]
+
+  run validate_storage_prefix "backups/../etc"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"prefix"* || "$output" == *"traversal"* ]]
+}
+
+@test "backup.sh rejects artifact names with control characters" {
+  run validate_artifact_name "$(printf 'soroban-backup\t.tar.gz.enc')"
+  [ "$status" -ne 0 ]
+
+  run validate_artifact_name "$(printf 'soroban-backup\n.tar.gz.enc')"
+  [ "$status" -ne 0 ]
+
+  run validate_storage_prefix "$(printf 'backups/\001soroban')"
+  [ "$status" -ne 0 ]
+}
+
+@test "backup.sh rejects empty artifact names and prefixes" {
+  run validate_artifact_name ""
+  [ "$status" -ne 0 ]
+
+  run validate_storage_prefix ""
+  [ "$status" -ne 0 ]
+}
+
+@test "backup.sh free-space preflight fails when the budget exceeds available space" {
+  run check_staging_free_space 1000000000000000 "$BATS_TEST_TMPDIR"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"free space"* || "$output" == *"insufficient"* ]]
+  [[ "$output" == *"backup_staging_free_space"* || "$output" == *"metric"* ]]
+}
+
+@test "backup.sh free-space preflight passes when the budget fits" {
+  run check_staging_free_space 1 "$BATS_TEST_TMPDIR"
+  [ "$status" -eq 0 ]
+}
