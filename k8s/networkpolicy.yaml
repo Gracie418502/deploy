@@ -47,6 +47,24 @@ spec:
     - protocol: TCP
       port: 8080
 ---
+# Backend egress policy.
+#
+# DNS egress is allowed to both supported resolver layouts:
+#   1. Standard kube-dns / CoreDNS ClusterIP (kube-system/k8s-app=kube-dns)
+#   2. NodeLocal DNS (kube-system/node-local-dns, a hostNetwork DaemonSet)
+#
+# NodeLocal DNS is opt-in: it is only present when the cluster has the
+# node-local-dns DaemonSet deployed. The extra egress rule below is harmless
+# on clusters that do not use it (it simply matches no pods).
+#
+# To discover the resolver address in use:
+#   kubectl -n kube-system get configmap kube-dns -o jsonpath='{.data.kubelet}'
+#   kubectl -n kube-system get daemonset node-local-dns -o wide
+#   kubectl -n kube-system get svc kube-dns -o wide
+#
+# Verify DNS works from a backend pod for both layouts:
+#   kubectl -n <ns> exec deploy/backend -- nslookup kubernetes.default
+#   kubectl -n <ns> exec deploy/backend -- getent hosts <external-host>
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -60,6 +78,7 @@ spec:
   policyTypes:
   - Egress
   egress:
+  # Standard kube-dns / CoreDNS resolver.
   - to:
     - namespaceSelector:
         matchLabels:
@@ -67,6 +86,19 @@ spec:
       podSelector:
         matchLabels:
           k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # NodeLocal DNS resolver (opt-in; matches no pods when not deployed).
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: node-local-dns
     ports:
     - protocol: UDP
       port: 53

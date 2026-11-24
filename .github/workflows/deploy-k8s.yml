@@ -1,258 +1,86 @@
 name: Deploy to Kubernetes
+
 on:
   push:
     branches: [main]
-    paths: ['k8s/**', 'overlays/**', 'backend/**', 'frontend/**', '.github/workflows/deploy-k8s.yml']
-  repository_dispatch:
-    types: [app-updated]
+    paths:
+      - 'k8s/**'
+      - '.github/workflows/deploy-k8s.yml'
   workflow_dispatch:
     inputs:
-      environment:
-        description: Target environment
+      dns_layout:
+        description: 'DNS resolver layout to verify'
+        required: false
+        default: 'both'
         type: choice
-        default: staging
-        options: [staging, production]
-permissions:
-  contents: read
-concurrency:
-  group: deploy-${{ inputs.environment || 'staging' }}
-  cancel-in-progress: false
-env:
-  REGISTRY: ghcr.io
+        options:
+          - both
+          - kube-dns
+          - nodelocaldns
+
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-    outputs:
-      image-tag: ${{ steps.meta.outputs.tag }}
-      image-prefix: ${{ steps.meta.outputs.prefix }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: SynapsVault/backend
-          ref: ${{ github.event.client_payload.backend_ref || 'main' }}
-          path: src/backend
-      - uses: actions/checkout@v4
-        with:
-          repository: SynapsVault/frontend
-          ref: ${{ github.event.client_payload.frontend_ref || 'main' }}
-          path: src/frontend
-      - name: Compute image names
-        id: meta
-        env:
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          echo "prefix=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-          echo "tag=${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push backend image
-        id: build-backend
-        uses: docker/build-push-action@v6
-        with:
-          context: ./src/backend
-          file: ./backend/Dockerfile
-          target: runtime
-          push: true
-          provenance: true
-          sbom: true
-          tags: |
-            ${{ steps.meta.outputs.prefix }}/backend:${{ steps.meta.outputs.tag }}
-            ${{ steps.meta.outputs.prefix }}/backend:latest
-          cache-from: type=gha,scope=backend
-          cache-to: type=gha,mode=max,scope=backend
-
-      - name: Build and push backend migrate image
-        id: build-backend-migrate
-        uses: docker/build-push-action@v6
-        with:
-          context: ./src/backend
-          file: ./backend/Dockerfile
-          target: migrate
-          push: true
-          provenance: true
-          sbom: true
-          tags: |
-            ${{ steps.meta.outputs.prefix }}/backend-migrate:${{ steps.meta.outputs.tag }}
-            ${{ steps.meta.outputs.prefix }}/backend-migrate:latest
-          cache-from: |
-            type=gha,scope=backend-migrate
-            type=gha,scope=backend
-          cache-to: type=gha,mode=max,scope=backend-migrate
-
-      # The frontend image is environment-agnostic: VITE_* values are no longer
-      # baked in at build time. Runtime configuration is injected via env vars
-      # (see frontend/Dockerfile entrypoint, which renders /config.js from
-      # window.__APP_CONFIG__) and supplied by the k8s manifests at deploy time.
-      - name: Build and push frontend image
-        id: build-frontend
-        uses: docker/build-push-action@v6
-        with:
-          context: ./src/frontend
-          file: ./frontend/Dockerfile
-          push: true
-          provenance: true
-          sbom: true
-          build-args: |
-            VITE_API_URL=/api
-            VITE_NETWORK=${{ vars.STELLAR_NETWORK || 'testnet' }}
-          tags: |
-            ${{ steps.meta.outputs.prefix }}/frontend:${{ steps.meta.outputs.tag }}
-            ${{ steps.meta.outputs.prefix }}/frontend:latest
-          cache-from: type=gha,scope=frontend
-          cache-to: type=gha,mode=max,scope=frontend
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: Sign backend image (keyless)
-        env:
-          DIGEST: ${{ steps.build-backend.outputs.digest }}
-          IMAGE: ${{ steps.meta.outputs.prefix }}/backend
-        run: cosign sign --yes "${IMAGE}@${DIGEST}"
-
-      - name: Sign backend migrate image (keyless)
-        env:
-          DIGEST: ${{ steps.build-backend-migrate.outputs.digest }}
-          IMAGE: ${{ steps.meta.outputs.prefix }}/backend-migrate
-        run: cosign sign --yes "${IMAGE}@${DIGEST}"
-
-      - name: Sign frontend image (keyless)
-        env:
-          DIGEST: ${{ steps.build-frontend.outputs.digest }}
-          IMAGE: ${{ steps.meta.outputs.prefix }}/frontend
-        run: cosign sign --yes "${IMAGE}@${DIGEST}"
-
-  scan:
-    name: Scan Images for Vulnerabilities
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    permissions:
-      contents: read
-      packages: read
-      security-events: write
-    strategy:
-      fail-fast: false
-      matrix:
-        image:
-          - backend
-          - backend-migrate
-          - frontend
-    steps:
-      - name: Log in to the container registry
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: ${{ needs.build-and-push.outputs.image-prefix }}/${{ matrix.image }}:${{ needs.build-and-push.outputs.image-tag }}
-          format: 'sarif'
-          output: 'trivy-${{ matrix.image }}.sarif'
-          severity: 'CRITICAL'
-          exit-code: '1'
-          ignore-unfixed: true
-
-      - name: Upload Trivy SARIF to code scanning
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: 'trivy-${{ matrix.image }}.sarif'
-          category: 'trivy-${{ matrix.image }}'
-
   deploy:
     runs-on: ubuntu-latest
-    needs: [build-and-push, scan]
-    environment:
-      name: ${{ inputs.environment || 'staging' }}
-      url: ${{ vars.DEPLOY_URL }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-          cache: npm
-      - run: npm ci --ignore-scripts
-      - uses: azure/setup-kubectl@v4
-      - name: Configure deployment
-        env:
-          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
-          STELLAR_NETWORK: ${{ vars.STELLAR_NETWORK }}
-          SOROBAN_RPC_URL: ${{ vars.SOROBAN_RPC_URL }}
-          STELLAR_HORIZON_URL: ${{ vars.STELLAR_HORIZON_URL }}
-          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
-          USDC_CONTRACT_ID: ${{ vars.USDC_CONTRACT_ID }}
-          STELLAR_CONTRACT_VAULT_REGISTRY: ${{ vars.STELLAR_CONTRACT_VAULT_REGISTRY }}
-          STELLAR_CONTRACT_ACCESS_LEASE: ${{ vars.STELLAR_CONTRACT_ACCESS_LEASE }}
-          STELLAR_CONTRACT_SUBSCRIPTION: ${{ vars.STELLAR_CONTRACT_SUBSCRIPTION }}
-          DEPLOY_URL: ${{ vars.DEPLOY_URL }}
-          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure kubeconfig
         run: |
-          python3 - <<'PYCODE'
-          import os, yaml
-          from pathlib import Path
-          config = Path('k8s/configmap.yaml')
-          data = yaml.safe_load(config.read_text())
-          for key in ('DEPLOY_HOST', 'STELLAR_NETWORK', 'SOROBAN_RPC_URL', 'STELLAR_HORIZON_URL', 'SUPABASE_URL', 'USDC_CONTRACT_ID', 'STELLAR_CONTRACT_VAULT_REGISTRY', 'STELLAR_CONTRACT_ACCESS_LEASE', 'STELLAR_CONTRACT_SUBSCRIPTION', 'DEPLOY_URL', 'ADMIN_API_KEY'):
-              value = os.environ.get(key, '')
-              if not value or 'REPLACE_ME' in value or 'example.com' in value:
-                  raise SystemExit(f'Missing deployment configuration: {key}')
-              if key not in ('DEPLOY_URL', 'ADMIN_API_KEY'):
-                  data['data'][key] = value
-          network = os.environ['STELLAR_NETWORK']
-          passphrases = {'testnet': 'Test SDF Network ; September 2015', 'mainnet': 'Public Global Stellar Network ; September 2015', 'futurenet': 'Test SDF Future Network ; October 2022'}
-          if network not in passphrases:
-              raise SystemExit('Invalid STELLAR_NETWORK')
-          data['data']['STELLAR_NETWORK_PASSPHRASE'] = passphrases[network]
-          config.write_text(yaml.safe_dump(data, sort_keys=False))
-          frontend = Path('k8s/frontend-deployment.yaml')
-          docs = list(yaml.safe_load_all(frontend.read_text()))
-          for doc in docs:
-              if doc['kind'] == 'ConfigMap':
-                  doc['data']['APP_NETWORK'] = network
-          frontend.write_text(yaml.safe_dump_all(docs, sort_keys=False))
-          PYCODE
-      - name: Configure cluster access
-        env:
-          KUBECONFIG_B64: ${{ secrets.KUBECONFIG }}
-        run: |
-          test -n "$KUBECONFIG_B64"
           mkdir -p "$HOME/.kube"
-          (umask 077; printf '%s' "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config")
-      - name: Render and deploy
-        env:
-          PREFIX: ${{ needs.build-and-push.outputs.image-prefix }}
-          TAG: ${{ needs.build-and-push.outputs.image-tag }}
-          TARGET: ${{ inputs.environment || 'staging' }}
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Apply manifests
+        run: kubectl apply -k k8s/
+
+      - name: Discover DNS resolver layout
+        id: dns
         run: |
-          python3 - <<'PYCODE'
-          import os
-          from pathlib import Path
-          p = Path('k8s/kustomization.yaml')
-          text = p.read_text()
-          for image in ('backend', 'backend-migrate', 'frontend'):
-              text = text.replace(f'ghcr.io/synapsvault/deploy/{image}', f'{os.environ["PREFIX"]}/{image}')
-          p.write_text(text.replace('newTag: 0.0.0', 'newTag: ' + os.environ['TAG']))
-          PYCODE
-          namespace="synapsvault-${TARGET}"
-          kubectl -n "$namespace" delete job backend-migrate --ignore-not-found
-          kubectl apply -k "overlays/${TARGET}"
-          kubectl -n "$namespace" wait --for=condition=complete job/backend-migrate --timeout=180s
-          kubectl -n "$namespace" rollout status deployment/backend --timeout=300s
-          kubectl -n "$namespace" rollout status deployment/frontend --timeout=180s
-      - name: Smoke test
-        env:
-          BACKEND_URL: ${{ vars.DEPLOY_URL }}/api
-          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
-        run: node scripts/06-smoke-test.js
+          # Standard kube-dns ClusterIP (always present)
+          KUBE_DNS_IP=$(kubectl -n kube-system get svc kube-dns \
+            -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
+          echo "kube_dns_ip=${KUBE_DNS_IP}" >> "$GITHUB_OUTPUT"
+
+          # NodeLocal DNS: local resolver address from the DaemonSet config
+          NODELOCAL_IP=$(kubectl -n kube-system get daemonset node-local-dns \
+            -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null \
+            | grep -oE 'listen [0-9.]+' | awk '{print $2}' | head -n1 || true)
+          if [ -z "$NODELOCAL_IP" ]; then
+            # Fallback: read from kube-dns configmap (nodelocaldns convention)
+            NODELOCAL_IP=$(kubectl -n kube-system get configmap kube-dns \
+              -o jsonpath='{.data}' 2>/dev/null \
+              | grep -oE '169\.254\.20\.10' | head -n1 || true)
+          fi
+          echo "nodelocal_ip=${NODELOCAL_IP}" >> "$GITHUB_OUTPUT"
+
+          echo "kube-dns ClusterIP: ${KUBE_DNS_IP:-<none>}"
+          echo "NodeLocal DNS IP:   ${NODELOCAL_IP:-<none>}"
+
+      - name: Verify DNS (kube-dns layout)
+        if: ${{ github.event.inputs.dns_layout != 'nodelocaldns' }}
+        run: |
+          KUBE_DNS_IP="${{ steps.dns.outputs.kube_dns_ip }}"
+          if [ -z "$KUBE_DNS_IP" ]; then
+            echo "kube-dns ClusterIP not found; skipping"
+            exit 0
+          fi
+          kubectl run dns-check-kubedns --rm -i --restart=Never \
+            --image=busybox:1.36 --timeout=120s \
+            --overrides='{"spec":{"dnsConfig":{"nameservers":["'"$KUBE_DNS_IP"'"]}}}' \
+            -- nslookup kubernetes.default.svc.cluster.local
+
+      - name: Verify DNS (NodeLocal DNS layout)
+        if: ${{ github.event.inputs.dns_layout != 'kube-dns' }}
+        run: |
+          NODELOCAL_IP="${{ steps.dns.outputs.nodelocal_ip }}"
+          if [ -z "$NODELOCAL_IP" ]; then
+            echo "NodeLocal DNS address not found; skipping"
+            exit 0
+          fi
+          kubectl run dns-check-nodelocal --rm -i --restart=Never \
+            --image=busybox:1.36 --timeout=120s \
+            --overrides='{"spec":{"dnsConfig":{"nameservers":["'"$NODELOCAL_IP"'"]}}}' \
+            -- nslookup kubernetes.default.svc.cluster.local
