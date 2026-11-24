@@ -18,6 +18,11 @@ spec:
     spec:
       serviceAccountName: frontend
       automountServiceAccountToken: false
+      # Optional private registry pull credentials (issue #172).
+      # Set `imagePullSecrets` in the kustomization to the name of a
+      # pre-provisioned docker-registry Secret; leave it unset for public
+      # registries so deployments keep working unchanged.
+      imagePullSecrets: []
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
