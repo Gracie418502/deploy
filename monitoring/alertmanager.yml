@@ -106,6 +106,10 @@ receivers:
 
 inhibit_rules:
   # A firing critical alert suppresses the matching warning for the same alert.
+  # The target is explicitly restricted to severity="warning" so critical
+  # notifications can never be inhibited by this rule (critical alerts are
+  # only ever sources here, never targets). Regression fixtures covering this
+  # behaviour live in monitoring/tests/alertmanager-routes.yml.
   - source_matchers:
       - severity="critical"
     target_matchers:

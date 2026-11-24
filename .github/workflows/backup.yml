@@ -153,6 +153,45 @@ jobs:
             echo "::warning::Retention cleanup failed (${retention_status}); a recoverable backup exists but old archives may remain."
           fi
 
+      - name: Verify backup telemetry emission
+        id: telemetry
+        if: always() && steps.config.outputs.ready == 'true'
+        env:
+          BACKUP_OUTPUT_DIR: backups
+        run: |
+          set -euo pipefail
+          # The absent/stale telemetry alert (monitoring/) can only distinguish a
+          # disconnected metrics pipeline from a reported backup failure if the
+          # workflow actually emits the expected series. Assert the staged
+          # metrics file carries the success flag and last-success timestamp.
+          metrics_file="$(ls -1t backups/**/*.prom backups/*.prom 2>/dev/null | head -n1 || true)"
+          emitted="false"
+          missing=""
+          if [[ -z "${metrics_file}" ]]; then
+            missing="metrics file not found"
+          else
+            for metric in soroban_backup_success soroban_backup_last_success_timestamp_seconds; do
+              if ! grep -qE "^${metric}(\\{|[[:space:]])" "${metrics_file}"; then
+                missing="${missing} ${metric}"
+              fi
+            done
+            if [[ -z "${missing}" ]]; then
+              emitted="true"
+            fi
+          fi
+          echo "emitted=${emitted}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Backup telemetry"
+            echo "- **Metrics file**: \`${metrics_file:-none}\`"
+            echo "- **Expected series emitted**: \`${emitted}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${emitted}" != "true" ]]; then
+            # Warn rather than fail: a missing series is exactly the condition
+            # the absent/stale telemetry alert is designed to page on, and the
+            # backup itself may still have succeeded.
+            echo "::warning::Backup telemetry incomplete (${missing:-unknown}); the absent/stale metrics alert will fire if this persists."
+          fi
+
       - name: Upload backup manifest and metrics
         if: always() && steps.config.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
@@ -306,10 +345,11 @@ jobs:
           BACKUP_RESULT: ${{ needs.backup.result }}
           UPLOAD_STATUS: ${{ needs.backup.outputs.upload_status }}
           RETENTION_STATUS: ${{ needs.backup.outputs.retention_status }}
+          TELEMETRY_EMITTED: ${{ needs.backup.outputs.telemetry_emitted }}
           VERIFY_RESULT: ${{ needs.verify-restore.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          msg="SynapsVault Database Backup workflow failed (backup=${BACKUP_RESULT}, upload=${UPLOAD_STATUS}, retention=${RETENTION_STATUS}, verify-restore=${VERIFY_RESULT}): ${RUN_URL}"
+          msg="SynapsVault Database Backup workflow failed (backup=${BACKUP_RESULT}, upload=${UPLOAD_STATUS}, retention=${RETENTION_STATUS}, telemetry=${TELEMETRY_EMITTED:-unknown}, verify-restore=${VERIFY_RESULT}): ${RUN_URL}"
           echo "::error::${msg}"
           if [[ -n "${ALERT_WEBHOOK_URL}" ]]; then
             payload="$(printf '{"text":"%s"}' "${msg}")"
@@ -322,6 +362,7 @@ jobs:
             echo "- **Backup job**: \`${BACKUP_RESULT}\`"
             echo "- **Upload status**: \`${UPLOAD_STATUS:-unknown}\`"
             echo "- **Retention status**: \`${RETENTION_STATUS:-unknown}\`"
+            echo "- **Telemetry emitted**: \`${TELEMETRY_EMITTED:-unknown}\`"
             echo "- **Verify-restore job**: \`${VERIFY_RESULT}\`"
             echo "- **Run URL**: ${RUN_URL}"
           } >> "$GITHUB_STEP_SUMMARY"

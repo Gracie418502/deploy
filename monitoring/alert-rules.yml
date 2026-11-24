@@ -285,6 +285,41 @@ groups:
           description: "The last successful backup for {{ $labels.instance }} was more than 26 hours ago, exceeding the expected backup interval."
           runbook_url: "https://github.com/example/soroban-backend/blob/main/docs/runbooks/backup-stale.md"
 
+      # Fires when backup telemetry is absent entirely, i.e. the metrics
+      # pipeline is disconnected (exporter/scrape target gone) rather than the
+      # backup process reporting a failure. BackupJobFailed requires
+      # soroban_backup_success to be present with value 0, so a failed backup
+      # and a missing metrics pipeline remain distinguishable.
+      - alert: BackupMetricsMissing
+        expr: |
+          absent(soroban_backup_success)
+          or
+          absent(soroban_backup_last_success_timestamp_seconds)
+        for: 15m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Backup metrics are not being exported"
+          description: "Prometheus has not received soroban_backup_success / soroban_backup_last_success_timestamp_seconds for more than 15 minutes. This indicates the backup metrics pipeline is disconnected (exporter or scrape target missing), not that a backup run failed. BackupJobFailed and BackupStale cannot fire while these metrics are absent."
+          runbook_url: "https://docs.example.com/runbooks/missing-metrics"
+
+      # Fires when the backup metrics exist but have stopped being updated,
+      # i.e. the exporter is still scraped but the backup job no longer
+      # reports. Distinct from BackupStale, which compares the reported
+      # last-success timestamp against the expected interval.
+      - alert: BackupMetricsStale
+        expr: |
+          time() - max(timestamp(soroban_backup_success)) > 26 * 3600
+        for: 15m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Backup metrics have stopped updating"
+          description: "The soroban_backup_success series has not been updated for more than 26 hours, so the backup job is no longer reporting telemetry. This points at a broken metrics pipeline rather than a failed backup run."
+          runbook_url: "https://docs.example.com/runbooks/missing-metrics"
+
   - name: stellar-soroban-rpc
     rules:
       - alert: StellarRpcErrors

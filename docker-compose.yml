@@ -144,10 +144,18 @@ services:
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      # Disk budget: prometheus_data is capped at ~5 GiB. Retention below is
+      # sized so the TSDB stays under that budget at the default scrape
+      # intervals; raise both together if you need a longer history.
       - prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
+      # Retention policy: keep at most 15 days of samples and never let the
+      # TSDB grow past 4 GiB (whichever limit is hit first). Override via
+      # PROMETHEUS_RETENTION_TIME / PROMETHEUS_RETENTION_SIZE.
+      - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-15d}"
+      - "--storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-4GB}"
       - "--web.enable-lifecycle"
     ports:
       - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
@@ -171,10 +179,15 @@ services:
       - monitoring
     volumes:
       - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      # Disk budget: alertmanager_data is capped at ~1 GiB; the retention
+      # window below keeps the notification log well within that.
       - alertmanager_data:/alertmanager
     command:
       - "--config.file=/etc/alertmanager/alertmanager.yml"
       - "--storage.path=/alertmanager"
+      # Retention policy: drop notification-log entries older than 120h (5d).
+      # Override via ALERTMANAGER_DATA_RETENTION.
+      - "--data.retention=${ALERTMANAGER_DATA_RETENTION:-120h}"
     ports:
       - "127.0.0.1:${ALERTMANAGER_PORT:-9093}:9093"
       - "${ALERTMANAGER_PORT:-9093}:9093"
@@ -197,7 +210,13 @@ services:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
       GF_USERS_ALLOW_SIGN_UP: "false"
+      # Retention policy: keep only the 20 most recent dashboard versions and
+      # expire login/audit records after 30 days.
+      GF_DASHBOARD_VERSIONS_TO_KEEP: ${GRAFANA_DASHBOARD_VERSIONS_TO_KEEP:-20}
+      GF_DATABASE_LOGGING_QUOTA_DAYS: ${GRAFANA_LOGGING_QUOTA_DAYS:-30}
     volumes:
+      # Disk budget: grafana_data is capped at ~1 GiB; the retention settings
+      # above keep dashboard history and logs within that budget.
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/backend-overview.json:ro
@@ -215,6 +234,10 @@ services:
     networks:
       - app_network
 
+# Monitoring volume disk budgets (see monitoring/README.md for sizing):
+#   prometheus_data    ~5 GiB  (TSDB capped at 4 GiB via --storage.tsdb.retention.size)
+#   alertmanager_data  ~1 GiB  (notification log trimmed via --data.retention)
+#   grafana_data       ~1 GiB  (dashboard versions / logs trimmed via GF_* env)
 volumes:
   postgres_data:
   prometheus_data:

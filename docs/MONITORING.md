@@ -398,6 +398,107 @@ verification record.
 > configured, the drill alert is routed by the default route — configure the
 > drill receiver before running the drill in production.
 
+## Backup telemetry: missing metrics vs. failed backups
+
+Two distinct alerts cover the backup pipeline, and they mean different things:
+
+| Alert | Meaning | Typical cause |
+| --- | --- | --- |
+| `BackupJobFailed` | The backup process ran and reported failure | Backup job error, storage full, credentials expired |
+| `BackupMetricsMissing` | Backup telemetry is absent or stale | Metrics pipeline disconnected, exporter down, scrape target gone, backup never ran |
+
+`BackupMetricsMissing` is a dedicated rule for absent or stale backup telemetry
+(e.g. `absent(backup_last_success_timestamp_seconds)` or a staleness check on
+the last successful run). It fires when Prometheus cannot see backup metrics at
+all, so a disconnected metrics pipeline is distinguishable from a backup
+process that ran and reported failure.
+
+When triaging:
+
+1. If `BackupMetricsMissing` fires, check the metrics pipeline first — scrape
+   target health (**Status → Targets**), the backup exporter process, and
+   network reachability. Do **not** assume the backups themselves failed.
+2. If `BackupJobFailed` fires, the pipeline is healthy and the backup process
+   itself reported an error; follow the backup runbook.
+3. If both fire, treat the pipeline as suspect until telemetry is restored, then
+   re-evaluate `BackupJobFailed`.
+
+## Alertmanager route regression fixtures
+
+The fixtures in [`monitoring/tests/`](../monitoring/tests) exercise Alertmanager
+routing, grouping and inhibition for representative warning and critical
+alerts. They verify:
+
+- **Destination selection:** critical alerts route to the paging receiver,
+  warning alerts route to the ticket/chat receiver, and drill alerts
+  (`drill="true"`) route to the dedicated drill receiver.
+- **Grouping:** alerts sharing `alertname`/`job` group into a single
+  notification; unrelated alerts do not.
+- **Inhibition:** a critical alert inhibits the matching warning alert for the
+  same target, and the fixtures assert that critical notifications are **not**
+  unintentionally inhibited (e.g. by an over-broad `equal` list or a
+  mis-scoped `source_match`).
+
+Run the fixtures as part of the verification workflow before changing
+`monitoring/alertmanager.yml`, and update them whenever routes, receivers or
+inhibit rules change.
+
+## Grafana query validation and empty-state behavior
+
+Dashboard PromQL expressions are validated against the same metric fixtures used
+by the alert tests, so a renamed or absent series is detected before it reaches
+a dashboard. When a series is absent or renamed:
+
+- Panels render an **empty state** (no data) rather than an error; this is
+  expected when a metric family is not yet exported or an environment has no
+  traffic.
+- A panel that stays empty while the corresponding alert is silent usually
+  indicates a renamed metric or label — check the metric names against
+  [Required metrics](#required-metrics) and the fixtures in
+  [`monitoring/tests/`](../monitoring/tests).
+- Empty is not the same as zero: use `absent()`-based alert rules (as the
+  backup and required-metric rules do) to surface missing series instead of
+  relying on a flat dashboard line.
+
+## Data retention and disk budgets
+
+The Compose monitoring stack sets explicit retention so volumes do not grow
+unbounded:
+
+| Service | Retention flag | Default |
+| --- | --- | --- |
+| Prometheus | `--storage.tsdb.retention.time` | `15d` |
+| Prometheus | `--storage.tsdb.retention.size` | `10GB` |
+| Alertmanager | `--data.retention` | `120h` |
+| Grafana | database retention (provisioned dashboards only; no metric storage) | n/a |
+
+Size the volumes from the retention window and ingest rate: estimate
+`daily_ingest_bytes × retention_days` and add ~30% headroom for compaction and
+WAL. The Prometheus volume should be at least the configured
+`--storage.tsdb.retention.size` plus headroom; Alertmanager needs only a small
+volume (silences and notification log).
+
+Verify the configured retention flags are applied to the running services:
+
+```bash
+# Prometheus: confirm the effective retention flags
+docker compose --profile monitoring exec prometheus \
+  promtool tsdb list /prometheus 2>/dev/null || true
+docker compose --profile monitoring exec prometheus \
+  sh -c 'ps -o args= -p 1' | tr ' ' '\n' | grep retention
+
+# Alertmanager: confirm data retention
+docker compose --profile monitoring exec alertmanager \
+  sh -c 'ps -o args= -p 1' | tr ' ' '\n' | grep data.retention
+
+# Volume usage against budget
+docker compose --profile monitoring exec prometheus du -sh /prometheus
+docker compose --profile monitoring exec alertmanager du -sh /alertmanager
+```
+
+If the flags are missing from the process arguments, the Compose file is not
+applying them — update `docker-compose.yml` and restart the affected service.
+
 ## Runbooks
 =======
 

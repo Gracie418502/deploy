@@ -85,6 +85,45 @@ tests:
         alertname: BackupStale
         exp_alerts: []
 
+  # Absent backup telemetry: no soroban_backup_* series at all, so the
+  # metrics pipeline is disconnected and BackupMetricsMissing must fire.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="backend",instance="backend:8080"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: BackupMetricsMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: backend
+            exp_annotations:
+              summary: Backup metrics are missing
+              description: No backup telemetry has been received for more than 26 hours; the metrics pipeline may be disconnected.
+              runbook_url: https://github.com/example/soroban-backend/blob/main/docs/runbooks/backup-metrics-missing.md
+
+  # Backup process reporting failure: telemetry is present but the last
+  # backup failed, so BackupJobFailed fires and BackupMetricsMissing must not.
+  - interval: 1m
+    input_series:
+      - series: 'soroban_backup_success'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: BackupJobFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              team: backend
+            exp_annotations:
+              summary: Backup job reported failure
+              description: The most recent backup run reported failure (soroban_backup_success == 0).
+              runbook_url: https://github.com/example/soroban-backend/blob/main/docs/runbooks/backup-failed.md
+      - eval_time: 30m
+        alertname: BackupMetricsMissing
+        exp_alerts: []
+
   - interval: 1m
     input_series:
       - series: 'soroban_alert_drill_active'
@@ -179,4 +218,42 @@ tests:
         exp_alerts: []
       - eval_time: 70m
         alertname: BackendErrorBudgetSlowBurn
+        exp_alerts: []
+
+  # Shared metric fixture set: the canonical series names and labels used by
+  # the alert rules, the Alertmanager route regression fixtures and the
+  # Grafana PromQL validation. Keep this in sync with
+  # monitoring/tests/fixtures/metrics.yml and monitoring/tests/grafana-queries.yml.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="backend",instance="backend:8080"}'
+        values: '1x10'
+      - series: 'http_requests_total{job="backend",status="500"}'
+        values: '0+1x10'
+      - series: 'http_requests_total{job="backend",status="200"}'
+        values: '0+999x10'
+      - series: 'soroban_backup_last_success_timestamp_seconds'
+        values: '0+1x10'
+      - series: 'soroban_backup_success'
+        values: '1x10'
+      - series: 'soroban_alert_drill_active'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: BackendDown
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: HighHttp5xxErrorRate
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: BackupStale
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: BackupMetricsMissing
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: BackupJobFailed
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: AlertDeliveryDrill
         exp_alerts: []
