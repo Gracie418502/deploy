@@ -63,11 +63,11 @@ images:
 # NetworkPolicies select on. It must name a single namespace; an empty value
 # would broaden access, so keep it set.
 #
-# `dns-resolver-ip` is the backend egress DNS target. It defaults to the
-# standard kube-dns ClusterIP (kube-system/kube-dns). Clusters running
-# NodeLocal DNS must override it with the node-local resolver address
-# (typically 169.254.20.10) so the backend NetworkPolicy allows DNS egress.
-# Discover the address with:
+# `dns-resolver-ip` is the egress DNS target for the backend and frontend
+# NetworkPolicies. It defaults to the standard kube-dns ClusterIP
+# (kube-system/kube-dns). Clusters running NodeLocal DNS must override it with
+# the node-local resolver address (typically 169.254.20.10) so the egress
+# NetworkPolicies allow DNS egress. Discover the address with:
 #   kubectl -n kube-system get svc kube-dns -o jsonpath='{.spec.clusterIP}'
 #   kubectl -n kube-system get ds node-local-dns \
 #     -o jsonpath='{.spec.template.spec.containers[0].args}' | tr ' ' '\n' | grep localip
@@ -116,9 +116,9 @@ replacements:
         fieldPaths:
           - metadata.labels.ingress-controller-namespace
   # Propagate the configured DNS resolver address onto the synapsvault
-  # Namespace as a label so the backend egress NetworkPolicy can select it
-  # without hardcoding the kube-dns ClusterIP. Override `dns-resolver-config`
-  # for NodeLocal DNS clusters (see above).
+  # Namespace as a label so the backend and frontend egress NetworkPolicies
+  # can select it without hardcoding the kube-dns ClusterIP. Override
+  # `dns-resolver-config` for NodeLocal DNS clusters (see above).
   - source:
       kind: ConfigMap
       name: dns-resolver-config

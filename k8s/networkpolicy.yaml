@@ -118,3 +118,62 @@ spec:
       port: 6543
     - protocol: TCP
       port: 443
+---
+# Frontend egress policy.
+#
+# The frontend serves static assets and runtime configuration from its own
+# container image; it does not call the backend or any external service at
+# runtime. Its only required egress is DNS resolution, so egress is restricted
+# to the cluster resolvers below.
+#
+# Permitted destinations:
+#   - kube-system/k8s-app=kube-dns (standard CoreDNS) on UDP/TCP 53
+#   - kube-system/k8s-app=node-local-dns (opt-in NodeLocal DNS) on UDP/TCP 53
+#
+# No external (0.0.0.0/0) egress is permitted. If the frontend later needs to
+# reach an upstream (e.g. an API gateway), add an explicit rule here and
+# document it alongside this policy.
+#
+# Verify static assets and runtime config still load:
+#   kubectl -n <ns> exec deploy/frontend -- nslookup kubernetes.default
+#   kubectl -n <ns> exec deploy/frontend -- wget -qO- http://localhost:8080/
+#   kubectl -n <ns> exec deploy/frontend -- wget -qO- http://localhost:8080/config.json
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-egress
+  labels:
+    app.kubernetes.io/name: frontend
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  policyTypes:
+  - Egress
+  egress:
+  # Standard kube-dns / CoreDNS resolver.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # NodeLocal DNS resolver (opt-in; matches no pods when not deployed).
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: node-local-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
