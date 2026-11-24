@@ -156,6 +156,18 @@ jobs:
             echo "kustomize_dir=${KUSTOMIZE_DIR}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # #156: an unsigned image, an unrecognised signing identity or an
+      # unpinned tag must stop the deploy before kubectl apply.
+      - name: Verify image signatures before apply
+        env:
+          COSIGN_IDENTITY: ${{ vars.COSIGN_IDENTITY }}
+          COSIGN_OIDC_ISSUER: ${{ vars.COSIGN_OIDC_ISSUER }}
+          KUSTOMIZE_DIR: ${{ steps.target.outputs.kustomize_dir }}
+        run: bash scripts/verify-image-signatures.sh "$KUSTOMIZE_DIR"
+
       - name: Apply manifests
         run: kubectl apply -k "${{ steps.target.outputs.kustomize_dir }}"
 
