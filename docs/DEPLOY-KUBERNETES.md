@@ -192,8 +192,16 @@ The backend and frontend repos can trigger a deploy when they change by sending 
 
 | `client_payload` field | Default | Purpose |
 | --- | --- | --- |
-| `backend_ref` | `main` | Git ref (branch, tag or SHA) of `SynapsVault/backend` to build |
-| `frontend_ref` | `main` | Git ref (branch, tag or SHA) of `SynapsVault/frontend` to build |
+| `backend_ref` | `refs/heads/main` | Git ref of `SynapsVault/backend` to build |
+| `frontend_ref` | `refs/heads/main` | Git ref of `SynapsVault/frontend` to build |
+| `backend_repository` (optional) | `SynapsVault/backend` | Must be a permitted source repository |
+| `frontend_repository` (optional) | `SynapsVault/frontend` | Must be a permitted source repository |
+
+Refs are validated **before any checkout or build**: each must be a full 40-character SHA
+or a `refs/heads/…` / `refs/tags/…` reference, and any supplied repository field must be
+one of `SynapsVault/backend` or `SynapsVault/frontend`. Malformed payloads stop the job
+immediately. The accepted refs and their resolved full SHAs are recorded in the release
+manifest (`sources.*.ref` / `sources.*.sha`), so a dispatch can be traced to exact revisions.
 
 Add a workflow like this to each app repo (`.github/workflows/deploy.yml`). It needs a token with `contents: write` on this repo stored as the `DEPLOY_DISPATCH_TOKEN` secret:
 
