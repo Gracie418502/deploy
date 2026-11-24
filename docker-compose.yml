@@ -117,7 +117,7 @@ services:
       - app_network
 
   postgres-exporter:
-    image: quay.io/prometheuscommunity/postgres-exporter:v0.20.1
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.21.1
     container_name: app_postgres_exporter
     restart: unless-stopped
     profiles:
