@@ -157,6 +157,35 @@ The [Deploy to Kubernetes](../.github/workflows/deploy-k8s.yml) workflow runs on
 
 It needs a base64-encoded kubeconfig in the `KUBECONFIG` secret of the `production` environment (`base64 -w0 < kubeconfig`). Until that secret exists, the deploy job is skipped with a warning; images are still built and pushed.
 
+#### Environment selection and cluster identity checks
+
+Manual dispatches choose an `environment` (`production` or `staging`); pushes to `main` deploy `production`. Each environment applies its own overlay into its own namespace:
+
+| Environment | Kustomization | Namespace |
+| --- | --- | --- |
+| `production` | `overlays/production` | `synapsvault-production` |
+| `staging` | `overlays/staging` | `synapsvault-staging` |
+
+The job runs in the matching GitHub environment, so `KUBE_CONFIG` can differ per environment. Set these **variables** on each GitHub environment to the cluster that environment must deploy to:
+
+| Variable | Example | Compared against |
+| --- | --- | --- |
+| `KUBE_EXPECTED_CONTEXT` | `prod-cluster` | `kubectl config current-context` |
+| `KUBE_EXPECTED_SERVER` | `https://prod.k8s.example.com:6443` | the current context's cluster `server` |
+
+Before anything is applied, the workflow checks the kubeconfig context and API server against these values. It also checks that the rendered overlay targets only the environment's namespace. If either variable is missing or anything differs, the job fails before any cluster change. For example, selecting `production` while `KUBE_CONFIG` holds staging credentials fails.
+
+#### Release manifest
+
+Every deploy uploads a `release-manifest-<environment>-<run id>-<attempt>` artifact containing `release-manifest.json`. The file records:
+
+- the environment and namespace;
+- the full commit SHAs of this repository (`sources.deploy`), and of `SynapsVault/backend` and `SynapsVault/frontend` resolved from the pinned refs in `.github/workflows/app-versions.env` (`sources.backend` and `sources.frontend`, each with the requested `ref`);
+- the image digests the rolled-out `backend` and `frontend` pods run (`images`);
+- the workflow run URL (`workflow_run_url`).
+
+The deploy fails if any of the three source revisions is not a full commit SHA. The app SHAs are checked before anything is applied, and all three are checked again before the manifest is uploaded. Use the manifest as the evidence link when adding a row to [`RELEASE-COMPATIBILITY.md`](RELEASE-COMPATIBILITY.md).
+
 #### Triggering a deploy from the app repos
 
 The backend and frontend repos can trigger a deploy when they change by sending a `repository_dispatch` event to this repo. The workflow listens for the `app-deploy` event type and reads the refs from the payload:
