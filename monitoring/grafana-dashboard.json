@@ -990,6 +990,7 @@
     "x402",
     "database"
   ],
+  "description": "PromQL expressions in this dashboard are validated against the shared metric fixtures used by alert tests (see scripts/validate-grafana-queries.sh). Expected empty-state behavior: when a referenced series is absent (e.g. no x402 payments yet, or a renamed metric), panels render 'No data' rather than an error; the validator fails CI on unknown or renamed series so empty states are only expected for genuinely idle metrics.",
   "templating": {
     "list": [
       {

@@ -35,3 +35,30 @@ spec:
       annotations:
         summary: High request latency (p95 > 1s)
         description: The 95th percentile request latency has exceeded 1s for 10 minutes.
+    - alert: BackupJobFailed
+      expr: backup_last_run_success == 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: Backup job reported failure
+        description: The most recent backup run reported failure. This indicates the
+          backup process itself failed, not that telemetry is missing.
+    - alert: BackupStale
+      expr: time() - backup_last_success_timestamp_seconds > 86400
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: Backup is stale
+        description: No successful backup has been recorded in more than 24 hours.
+    - alert: BackupMetricsMissing
+      expr: absent(backup_last_run_success) or absent(backup_last_success_timestamp_seconds)
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: Backup telemetry is absent or stale
+        description: Backup metrics have not been reported for more than 15 minutes.
+          This indicates a disconnected or broken metrics pipeline, which is distinct
+          from a backup process reporting failure (see BackupJobFailed).

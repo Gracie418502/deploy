@@ -339,7 +339,7 @@ jobs:
           cp monitoring/alert-rules.yml /tmp/prom/
           sed 's#/etc/prometheus/alert-rules.yml#alert-rules.yml#' monitoring/prometheus.yml > /tmp/prom/prometheus.yml
           promtool check config /tmp/prom/prometheus.yml
-      - name: Check Alertmanager config
+      - name: Render Alertmanager config with CI placeholders
         run: |
           # shellcheck disable=SC2016
           sed \
@@ -352,9 +352,25 @@ jobs:
             -e 's#\${ALERTMANAGER_PAGERDUTY_SERVICE_KEY}#ci-pagerduty-key#g' \
             -e 's#\${ALERTMANAGER_EMAIL_TO}#alerts@example.com#g' \
             monitoring/alertmanager.yml > /tmp/alertmanager.yml
-          amtool check-config /tmp/alertmanager.yml
+      - name: Check Alertmanager config
+        run: amtool check-config /tmp/alertmanager.yml
+      - name: Test Alertmanager routing, grouping and inhibition
+        # Exercises representative warning and critical alerts against the
+        # rendered config: asserts destination selection per severity and that
+        # critical alerts are never unintentionally inhibited.
+        run: python3 monitoring/tests/alertmanager_routes_test.py /tmp/alertmanager.yml
       - name: Check Grafana dashboard JSON
         run: python3 -m json.tool monitoring/grafana-dashboard.json > /dev/null
+      - name: Validate Grafana PromQL against metric fixtures
+        # Extracts every dashboard expression and checks the referenced metric
+        # names/labels against the shared fixture set used by the alert tests.
+        # Renamed or absent series fail the job; expected empty-state behavior
+        # is documented in docs/monitoring.md.
+        run: python3 monitoring/tests/grafana_promql_test.py monitoring/grafana-dashboard.json monitoring/tests/metric-fixtures.yml
+      - name: Verify monitoring retention flags and disk budgets
+        # Asserts the Compose monitoring services apply explicit retention
+        # flags and that the documented volume budgets match the compose file.
+        run: python3 monitoring/tests/retention_budget_test.py docker-compose.yml docs/monitoring.md
 
   monitoring-drill:
     name: Synthetic alert delivery drill

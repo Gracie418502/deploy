@@ -44,6 +44,30 @@ Both run from [`.github/workflows/backup.yml`](../.github/workflows/backup.yml) 
 | `retention_status` | `success` when the configured retention/pruning step completed; `failed` when pruning errored | Same places as `upload_status` |
 
 **A recoverable backup exists whenever `upload_status=success`, even if `retention_status=failed`.** A pruning failure means old backups may accumulate (and bucket lifecycle rules still apply); it does **not** mean the new backup is missing. The script exits non-zero when either status is `failed`, but the summary and status file always distinguish the two so a retention failure is never mistaken for a lost backup — or vice versa. When `retention_status=failed`, check bucket usage and re-run pruning (or rely on the bucket lifecycle policy in section 3); no re-upload is needed.
+
+### Backup telemetry: missing metrics vs. failed backup
+
+Alerting distinguishes **absent/stale backup telemetry** from a **backup process that reported failure**. These are different incidents with different first responses:
+
+| Alert | Meaning | First response |
+| --- | --- | --- |
+| `BackupMetricsMissing` | No backup telemetry has been received within the expected window (the metrics pipeline is disconnected, the exporter is down, or the job never ran). It says **nothing** about whether the backup succeeded or failed. | Investigate the telemetry path first: is the metrics pipeline/exporter reachable, is the scheduled job running, are credentials for the metrics sink valid? Do **not** assume a backup is missing or that one failed. |
+| `BackupJobFailed` | The backup process itself ran and reported failure (non-zero exit, `upload_status=failed`, or a preflight failure such as `backup_preflight_free_space_failed`). | Follow the failure diagnostics in the run summary and `backup-status.json`; re-run after fixing the cause. |
+
+Because `BackupMetricsMissing` fires on the absence of data, it must never be interpreted as evidence of a failed backup — and a silent metrics outage must not mask a real failure. When `BackupMetricsMissing` fires, confirm the actual backup state out-of-band (workflow run history, `backup-status.json` artifact, or the objects under `s3://<bucket>/backups/`) before escalating as a backup incident.
+
+#### Verifying telemetry is flowing
+
+`scripts/backup.sh` emits the following metrics; use them to confirm the pipeline is connected before trusting the absence of `BackupJobFailed`:
+
+| Metric | Emitted when |
+| --- | --- |
+| `backup_run_started` | At the start of a run, before any dump or upload |
+| `backup_upload_status` | When the upload outcome is known (`success`/`failed`) |
+| `backup_retention_status` | When the retention/pruning outcome is known (`success`/`failed`) |
+| `backup_preflight_free_space_failed` | When the staging free-space preflight fails (includes required/available bytes) |
+
+To verify telemetry end-to-end, trigger a manual run (**Run workflow** → `backup`) and confirm `backup_run_started` and `backup_upload_status` arrive at the metrics sink. If they do not, the `BackupMetricsMissing` alert is a pipeline problem, not a backup problem — fix the pipeline and re-check; only then treat a continued absence as a possible missed backup.
 =======
 
 ### Required configuration
@@ -641,6 +665,7 @@ Locally, upload it manually if needed: `aws s3 cp restore-audit-*.json s3://<buc
 - `backup.sh --dry-run` prints the planned components (database dump, contract snapshots), the destination bucket/prefix and the retention actions that would run, then exits. It performs **no** dump, upload or delete, and never prints credentials, keys or connection strings (they are redacted). Use it to validate configuration changes safely.
 - `restore.sh --plan` is exercised in the verification workflow to confirm a backup's metadata and archive safety without touching a database.
 - The verification workflow also covers a successful upload followed by a failed retention cleanup, asserting `upload_status=success` and `retention_status=failed` are reported separately.
+- The verification workflow asserts that a disconnected metrics pipeline raises `BackupMetricsMissing` while a backup that reports failure raises `BackupJobFailed`, so the two conditions are distinguishable (see section 2, "Backup telemetry: missing metrics vs. failed backup").
 - Full restore drills are performed **quarterly** in the staging environment.
 - Drill results (time to restore, issues encountered) are recorded in the incident log.
 - Any gaps identified during drills must be addressed before the next drill.

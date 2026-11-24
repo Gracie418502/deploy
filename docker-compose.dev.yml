@@ -5,6 +5,17 @@
 #
 # Bind-mounts application sources and runs the dev servers with hot reload
 # instead of the production build/start commands.
+#
+# Monitoring retention:
+#   The monitoring stack (Prometheus, Grafana, etc.) is defined in the base
+#   docker-compose.yml. This dev override intentionally does NOT redefine any
+#   monitoring services, so local runs inherit the base retention flags and
+#   volume budgets unchanged (e.g. Prometheus `--storage.tsdb.retention.time`
+#   and `--storage.tsdb.retention.size`, and the bounded named volumes). This
+#   keeps dev and production retention behavior identical. If you need shorter
+#   retention locally, add an explicit override in a separate compose file
+#   rather than editing this one, so the base budgets remain the source of
+#   truth.
 
 services:
   backend:
