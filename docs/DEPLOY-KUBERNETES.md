@@ -175,6 +175,19 @@ The job runs in the matching GitHub environment, so `KUBE_CONFIG` can differ per
 
 Before anything is applied, the workflow checks the kubeconfig context and API server against these values. It also checks that the rendered overlay targets only the environment's namespace. If either variable is missing or anything differs, the job fails before any cluster change. For example, selecting `production` while `KUBE_CONFIG` holds staging credentials fails.
 
+#### Failure diagnostics
+
+When any deploy step fails, the workflow always collects pod status, pod YAML,
+namespace events and the `backend-migrate` Job status into a `deploy-diagnostics/`
+artifact (`deploy-diagnostics-<environment>-<run>-<attempt>`). Every line is passed
+through `scripts/sanitize-diagnostics.mjs` before upload: Kubernetes Secret objects
+are dropped entirely, sensitive env values (`*PASSWORD*`, `*TOKEN*`, `*KEY*`, DSNs,
+credentials in URLs) are replaced with `[REDACTED]`, and non-sensitive values such
+as image tags and log levels are kept so the artifact is still useful.
+
+`node --test test/failure-diagnostics.test.cjs` verifies the sanitizer and collector
+with fake `kubectl` output.
+
 #### Release manifest
 
 Every deploy uploads a `release-manifest-<environment>-<run id>-<attempt>` artifact containing `release-manifest.json`. The file records:
