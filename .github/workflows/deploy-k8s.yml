@@ -29,6 +29,8 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # #158: hard ceiling for the whole deployment job.
+    timeout-minutes: 30
     # Environment-scoped secrets/variables: KUBE_CONFIG plus the expected cluster
     # identity (KUBE_EXPECTED_CONTEXT, KUBE_EXPECTED_SERVER) for that environment.
     environment: ${{ github.event.inputs.environment || 'production' }}
@@ -38,8 +40,10 @@ jobs:
       EXPECTED_KUBE_SERVER: ${{ vars.KUBE_EXPECTED_SERVER }}
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 10
 
       - name: Load pinned app refs
+        timeout-minutes: 10
         id: refs
         run: |
           . ./.github/workflows/app-versions.env
@@ -49,6 +53,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout backend source
+        timeout-minutes: 10
         uses: actions/checkout@v4
         with:
           repository: SynapsVault/backend
@@ -58,6 +63,7 @@ jobs:
           persist-credentials: false
 
       - name: Checkout frontend source
+        timeout-minutes: 10
         uses: actions/checkout@v4
         with:
           repository: SynapsVault/frontend
@@ -67,6 +73,7 @@ jobs:
           persist-credentials: false
 
       - name: Resolve source revisions
+        timeout-minutes: 10
         id: revisions
         run: |
           set -euo pipefail
@@ -89,9 +96,11 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up kubectl
+        timeout-minutes: 10
         uses: azure/setup-kubectl@v4
 
       - name: Configure kubeconfig
+        timeout-minutes: 10
         run: |
           mkdir -p "$HOME/.kube"
           echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
@@ -100,6 +109,7 @@ jobs:
       # Runs before any mutation: a production selection paired with staging
       # credentials (or vice versa) fails here.
       - name: Verify cluster context and namespace for the selected environment
+        timeout-minutes: 10
         id: target
         run: |
           set -euo pipefail
@@ -157,14 +167,17 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Apply manifests
+        timeout-minutes: 10
         run: kubectl apply -k "${{ steps.target.outputs.kustomize_dir }}"
 
       - name: Wait for rollouts
+        timeout-minutes: 10
         run: |
           kubectl -n "${{ steps.target.outputs.namespace }}" rollout status deployment/backend --timeout=300s
           kubectl -n "${{ steps.target.outputs.namespace }}" rollout status deployment/frontend --timeout=300s
 
       - name: Write release manifest
+        timeout-minutes: 10
         env:
           NAMESPACE: ${{ steps.target.outputs.namespace }}
           DEPLOY_SHA: ${{ steps.revisions.outputs.deploy }}
@@ -232,6 +245,7 @@ jobs:
           cat release-manifest.json
 
       - name: Upload release manifest
+        timeout-minutes: 10
         uses: actions/upload-artifact@v4
         with:
           name: release-manifest-${{ env.DEPLOY_ENV }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -239,6 +253,7 @@ jobs:
           if-no-files-found: error
 
       - name: Discover DNS resolver layout
+        timeout-minutes: 10
         id: dns
         run: |
           # Standard kube-dns ClusterIP (always present)
@@ -262,6 +277,7 @@ jobs:
           echo "NodeLocal DNS IP:   ${NODELOCAL_IP:-<none>}"
 
       - name: Verify DNS (kube-dns layout)
+        timeout-minutes: 10
         if: ${{ github.event.inputs.dns_layout != 'nodelocaldns' }}
         run: |
           KUBE_DNS_IP="${{ steps.dns.outputs.kube_dns_ip }}"
@@ -275,6 +291,7 @@ jobs:
             -- nslookup kubernetes.default.svc.cluster.local
 
       - name: Verify DNS (NodeLocal DNS layout)
+        timeout-minutes: 10
         if: ${{ github.event.inputs.dns_layout != 'kube-dns' }}
         run: |
           NODELOCAL_IP="${{ steps.dns.outputs.nodelocal_ip }}"

@@ -175,6 +175,28 @@ The job runs in the matching GitHub environment, so `KUBE_CONFIG` can differ per
 
 Before anything is applied, the workflow checks the kubeconfig context and API server against these values. It also checks that the rendered overlay targets only the environment's namespace. If either variable is missing or anything differs, the job fails before any cluster change. For example, selecting `production` while `KUBE_CONFIG` holds staging credentials fails.
 
+#### Timeout budget
+
+The deploy job has a hard ceiling of **30 minutes** (`timeout-minutes` on the job) and
+every step has its own cap. Once a step exceeds its cap GitHub cancels it, and once the
+job reaches 30 minutes the whole run is cancelled — a stalled `kubectl` call or a hung
+rollout wait cannot run indefinitely.
+
+| Phase | Step budget |
+| --- | --- |
+| Checkout / ref resolution / kubeconfig / target verification | 10 minutes each |
+| Apply, rollout wait, DNS checks, manifest upload | 10 minutes each |
+| Whole deploy job | 30 minutes |
+
+Image builds happen in the `SynapsVault/backend` and `SynapsVault/frontend` workflows,
+not in this repository. Those build jobs must carry their own `timeout-minutes`
+(15 minutes recommended); this deploy consumes only digest-pinned artifacts, so a
+build that exceeds its budget never produces a deployable image.
+
+`npm run check:deploy-timeouts` verifies that the job ceiling and every step timeout
+are present; `test/deploy-timeouts.test.cjs` also proves the checker rejects a workflow
+with a missing ceiling or step timeout.
+
 #### Release manifest
 
 Every deploy uploads a `release-manifest-<environment>-<run id>-<attempt>` artifact containing `release-manifest.json`. The file records:
