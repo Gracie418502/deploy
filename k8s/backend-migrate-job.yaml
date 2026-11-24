@@ -13,6 +13,8 @@ spec:
         app: backend-migrate
     spec:
       restartPolicy: Never
+      imagePullSecrets:
+        - name: registry-pull-secret
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000

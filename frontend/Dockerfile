@@ -80,9 +80,12 @@ RUN printf '%s\n' \
     '    add_header Content-Security-Policy "default-src '\''self'\''; script-src '\''self'\''; style-src '\''self'\'' '\''unsafe-inline'\''; img-src '\''self'\'' data:; font-src '\''self'\'' data:; connect-src '\''self'\''; frame-ancestors '\''none'\''; base-uri '\''self'\''; form-action '\''self'\'';" always;' \
     '    location = /healthz { access_log off; add_header Cache-Control "no-store"; default_type text/plain; return 200 "ok\n"; }' \
     '    location = /config.js { alias /tmp/config.js; add_header Cache-Control "no-store"; }' \
-    '    location /assets/ { try_files $uri =404; }' \
-    '    location ~* \.(?:js|css|map|png|jpg|jpeg|gif|svg|webp|ico|woff2?|ttf|eot)$ { try_files $uri =404; }' \
-    '    location / { try_files $uri $uri/ /index.html; }' \
+    '    # Hashed build assets are content-addressed and safe to cache immutably.' \
+    '    location /assets/ { try_files $uri =404; add_header Cache-Control "public, max-age=31536000, immutable" always; }' \
+    '    location ~* \.(?:js|css|map|png|jpg|jpeg|gif|svg|webp|ico|woff2?|ttf|eot)$ { try_files $uri =404; add_header Cache-Control "public, max-age=31536000, immutable" always; }' \
+    '    # The SPA entry document must always revalidate so new releases are picked up.' \
+    '    location = /index.html { add_header Cache-Control "no-cache, must-revalidate" always; }' \
+    '    location / { try_files $uri $uri/ /index.html; add_header Cache-Control "no-cache, must-revalidate" always; }' \
     '  }' \
     '}' > /etc/nginx/nginx.conf \
     && apk add --no-cache jq=1.8.2-r0
