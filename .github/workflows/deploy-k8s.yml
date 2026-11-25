@@ -6,6 +6,8 @@ on:
     paths:
       - 'k8s/**'
       - '.github/workflows/deploy-k8s.yml'
+  repository_dispatch:
+    types: [app-deploy]
   workflow_dispatch:
     inputs:
       environment:
@@ -44,9 +46,22 @@ jobs:
 
       - name: Load pinned app refs
         timeout-minutes: 10
+      - name: Load and validate app refs
         id: refs
+        env:
+          DISPATCH_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+          ALLOWED_REPOSITORIES: SynapsVault/backend,SynapsVault/frontend
         run: |
+          set -euo pipefail
           . ./.github/workflows/app-versions.env
+          # #155: repository_dispatch refs are untrusted input. Validate the
+          # format and permitted source repositories BEFORE any checkout.
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            VALIDATED=$(node scripts/validate-dispatch-refs.mjs)
+            BACKEND_REF=$(printf '%s\n' "$VALIDATED" | sed -n 's/^backend_ref=//p')
+            FRONTEND_REF=$(printf '%s\n' "$VALIDATED" | sed -n 's/^frontend_ref=//p')
+            printf '%s\n' "$VALIDATED"
+          fi
           {
             echo "backend=${BACKEND_REF}"
             echo "frontend=${FRONTEND_REF}"
@@ -165,6 +180,18 @@ jobs:
             echo "namespace=${EXPECTED_NAMESPACE}"
             echo "kustomize_dir=${KUSTOMIZE_DIR}"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # #156: an unsigned image, an unrecognised signing identity or an
+      # unpinned tag must stop the deploy before kubectl apply.
+      - name: Verify image signatures before apply
+        env:
+          COSIGN_IDENTITY: ${{ vars.COSIGN_IDENTITY }}
+          COSIGN_OIDC_ISSUER: ${{ vars.COSIGN_OIDC_ISSUER }}
+          KUSTOMIZE_DIR: ${{ steps.target.outputs.kustomize_dir }}
+        run: bash scripts/verify-image-signatures.sh "$KUSTOMIZE_DIR"
 
       - name: Apply manifests
         timeout-minutes: 10

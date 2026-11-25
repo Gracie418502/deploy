@@ -84,20 +84,35 @@ spec:
           periodSeconds: 5
           timeoutSeconds: 3
           failureThreshold: 6
+        # Scratch-space needs (issue #165): the read-only root filesystem
+        # forces nginx to write to the emptyDir volumes below. nginx-cache
+        # holds proxy/buffer temp files, nginx-run holds the pid file and
+        # socket, and tmp holds transient request bodies. The emptyDir
+        # sizeLimits (64Mi + 8Mi + 16Mi = 88Mi) plus a small headroom for
+        # container logs are covered by the ephemeral-storage limit below.
+        # Verify normal startup under these limits by rolling out the
+        # Deployment and confirming pods reach Ready (startupProbe passes)
+        # and that `kubectl describe pod` shows no ephemeral-storage
+        # eviction or emptyDir sizeLimit errors.
         resources:
           requests:
             cpu: 50m
             memory: 64Mi
+            ephemeral-storage: 64Mi
           limits:
             cpu: 250m
             memory: 128Mi
+            ephemeral-storage: 256Mi
       volumes:
       - name: nginx-cache
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: 64Mi
       - name: nginx-run
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: 8Mi
       - name: tmp
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: 16Mi
 ---
 apiVersion: v1
 kind: ConfigMap

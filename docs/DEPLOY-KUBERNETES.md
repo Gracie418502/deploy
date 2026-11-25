@@ -196,6 +196,19 @@ build that exceeds its budget never produces a deployable image.
 `npm run check:deploy-timeouts` verifies that the job ceiling and every step timeout
 are present; `test/deploy-timeouts.test.cjs` also proves the checker rejects a workflow
 with a missing ceiling or step timeout.
+#### Image signature gate
+
+Immediately before `kubectl apply`, every image in the rendered kustomization must be
+pinned by `sha256` digest and carry a cosign signature from the expected build workflow:
+
+| Variable | Example |
+| --- | --- |
+| `COSIGN_IDENTITY` | `https://github.com/SynapsVault/backend/.github/workflows/build-image.yml@refs/heads/main` |
+| `COSIGN_OIDC_ISSUER` | `https://token.actions.githubusercontent.com` |
+
+The gate is implemented by `scripts/verify-image-signatures.sh`. Missing variables, a
+mutable tag, an unsigned image, or a signature from a different identity/issuer all stop
+the deploy before any manifest is applied.
 
 #### Release manifest
 
@@ -214,8 +227,16 @@ The backend and frontend repos can trigger a deploy when they change by sending 
 
 | `client_payload` field | Default | Purpose |
 | --- | --- | --- |
-| `backend_ref` | `main` | Git ref (branch, tag or SHA) of `SynapsVault/backend` to build |
-| `frontend_ref` | `main` | Git ref (branch, tag or SHA) of `SynapsVault/frontend` to build |
+| `backend_ref` | `refs/heads/main` | Git ref of `SynapsVault/backend` to build |
+| `frontend_ref` | `refs/heads/main` | Git ref of `SynapsVault/frontend` to build |
+| `backend_repository` (optional) | `SynapsVault/backend` | Must be a permitted source repository |
+| `frontend_repository` (optional) | `SynapsVault/frontend` | Must be a permitted source repository |
+
+Refs are validated **before any checkout or build**: each must be a full 40-character SHA
+or a `refs/heads/…` / `refs/tags/…` reference, and any supplied repository field must be
+one of `SynapsVault/backend` or `SynapsVault/frontend`. Malformed payloads stop the job
+immediately. The accepted refs and their resolved full SHAs are recorded in the release
+manifest (`sources.*.ref` / `sources.*.sha`), so a dispatch can be traced to exact revisions.
 
 Add a workflow like this to each app repo (`.github/workflows/deploy.yml`). It needs a token with `contents: write` on this repo stored as the `DEPLOY_DISPATCH_TOKEN` secret:
 
