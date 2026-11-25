@@ -41,6 +41,26 @@ spec:
             requests:
               cpu: 100m
               memory: 128Mi
+              # Scratch space for writable emptyDir volumes (see volumes below).
+              # Startup only needs a few MiB; 64Mi request leaves headroom.
+              ephemeral-storage: 64Mi
             limits:
               cpu: 500m
               memory: 512Mi
+              # Caps total ephemeral storage (emptyDir + container writable layer).
+              # Must be >= sum of emptyDir sizeLimits below (256Mi + 64Mi).
+              ephemeral-storage: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /var/cache/backend
+      volumes:
+        # Writable scratch volumes are bounded so a runaway process cannot
+        # exhaust node disk. Adjust sizeLimit if the app needs more scratch.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: cache
+          emptyDir:
+            sizeLimit: 64Mi
