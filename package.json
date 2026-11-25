@@ -21,7 +21,8 @@
     "format": "prettier --write \"scripts/**/*.{js,cjs}\" \"test/**/*.{cjs,mjs}\" \"*.{json,md}\"",
     "format:check": "prettier --check \"scripts/**/*.{js,cjs}\" \"test/**/*.{cjs,mjs}\" \"*.{json,md}\"",
     "test": "node --test \"test/**/*.test.cjs\"",
-    "test:smoke": "node scripts/06-smoke-test.js"
+    "test:smoke": "node scripts/06-smoke-test.js",
+    "check:deploy-timeouts": "node scripts/check-deploy-timeouts.mjs"
   },
   "devDependencies": {
     "eslint": "10.15.0",
