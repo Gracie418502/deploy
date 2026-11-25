@@ -6,6 +6,8 @@ on:
     paths:
       - 'k8s/**'
       - '.github/workflows/deploy-k8s.yml'
+  repository_dispatch:
+    types: [app-deploy]
   workflow_dispatch:
     inputs:
       environment:
@@ -39,10 +41,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Load pinned app refs
+      - name: Load and validate app refs
         id: refs
+        env:
+          DISPATCH_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+          ALLOWED_REPOSITORIES: SynapsVault/backend,SynapsVault/frontend
         run: |
+          set -euo pipefail
           . ./.github/workflows/app-versions.env
+          # #155: repository_dispatch refs are untrusted input. Validate the
+          # format and permitted source repositories BEFORE any checkout.
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            VALIDATED=$(node scripts/validate-dispatch-refs.mjs)
+            BACKEND_REF=$(printf '%s\n' "$VALIDATED" | sed -n 's/^backend_ref=//p')
+            FRONTEND_REF=$(printf '%s\n' "$VALIDATED" | sed -n 's/^frontend_ref=//p')
+            printf '%s\n' "$VALIDATED"
+          fi
           {
             echo "backend=${BACKEND_REF}"
             echo "frontend=${FRONTEND_REF}"
