@@ -193,9 +193,61 @@ jobs:
           KUSTOMIZE_DIR: ${{ steps.target.outputs.kustomize_dir }}
         run: bash scripts/verify-image-signatures.sh "$KUSTOMIZE_DIR"
 
+      - name: Stamp config checksum into backend Deployment
+        timeout-minutes: 10
+        # #163: Roll backend pods when backend-config changes so envFrom
+        # updates take effect without an image change. Computes a SHA-256 of
+        # the rendered ConfigMap data (post-substitution) and injects it as a
+        # pod-template annotation via a strategic-merge patch. Any change to a
+        # runtime config value produces a new hash → new pod template → rollout,
+        # while keeping the selectors (matchLabels) immutable.
+        env:
+          KUSTOMIZE_DIR: ${{ steps.target.outputs.kustomize_dir }}
+          NAMESPACE: ${{ steps.target.outputs.namespace }}
+        run: |
+          set -euo pipefail
+          CONFIG_HASH=$(kubectl kustomize "$KUSTOMIZE_DIR" \
+            | yq -N 'select(.kind == "ConfigMap" and .metadata.name == "backend-config") | .data' \
+            | sha256sum | awk '{print $1}')
+          if ! [[ "$CONFIG_HASH" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not compute a valid SHA-256 for backend-config"
+            exit 1
+          fi
+          echo "backend-config checksum: ${CONFIG_HASH}"
+          cat > /tmp/backend-checksum-patch.yaml <<PATCH
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: backend
+            namespace: ${NAMESPACE}
+          spec:
+            template:
+              metadata:
+                annotations:
+                  checksum/backend-config: "${CONFIG_HASH}"
+          PATCH
+          kubectl apply -k "$KUSTOMIZE_DIR" --dry-run=client \
+            --patch /tmp/backend-checksum-patch.yaml > /dev/null
+          echo "CONFIG_HASH=${CONFIG_HASH}" >> "$GITHUB_ENV"
+
       - name: Apply manifests
         timeout-minutes: 10
-        run: kubectl apply -k "${{ steps.target.outputs.kustomize_dir }}"
+        env:
+          NAMESPACE: ${{ steps.target.outputs.namespace }}
+          CONFIG_HASH: ${{ env.CONFIG_HASH }}
+        run: |
+          set -euo pipefail
+          KUSTOMIZE_DIR="${{ steps.target.outputs.kustomize_dir }}"
+          # Apply the base manifests first.
+          kubectl apply -k "$KUSTOMIZE_DIR"
+          # Patch the config checksum annotation so a ConfigMap change alone
+          # triggers a rollout even when the image tag is unchanged.
+          if [ -n "${CONFIG_HASH:-}" ]; then
+            kubectl patch deployment backend \
+              -n "$NAMESPACE" \
+              --type=merge \
+              -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"checksum/backend-config\":\"${CONFIG_HASH}\"}}}}}"
+          fi
 
       - name: Wait for rollouts
         timeout-minutes: 10
