@@ -175,6 +175,20 @@ The job runs in the matching GitHub environment, so `KUBE_CONFIG` can differ per
 
 Before anything is applied, the workflow checks the kubeconfig context and API server against these values. It also checks that the rendered overlay targets only the environment's namespace. If either variable is missing or anything differs, the job fails before any cluster change. For example, selecting `production` while `KUBE_CONFIG` holds staging credentials fails.
 
+#### Image signature gate
+
+Immediately before `kubectl apply`, every image in the rendered kustomization must be
+pinned by `sha256` digest and carry a cosign signature from the expected build workflow:
+
+| Variable | Example |
+| --- | --- |
+| `COSIGN_IDENTITY` | `https://github.com/SynapsVault/backend/.github/workflows/build-image.yml@refs/heads/main` |
+| `COSIGN_OIDC_ISSUER` | `https://token.actions.githubusercontent.com` |
+
+The gate is implemented by `scripts/verify-image-signatures.sh`. Missing variables, a
+mutable tag, an unsigned image, or a signature from a different identity/issuer all stop
+the deploy before any manifest is applied.
+
 #### Release manifest
 
 Every deploy uploads a `release-manifest-<environment>-<run id>-<attempt>` artifact containing `release-manifest.json`. The file records:
